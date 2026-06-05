@@ -17,10 +17,18 @@ Graph topology is stored as per-predicate [SciPy CSR matrices](https://docs.scip
 
 - **Python 3.14+** (uses the built-in `compression.zstd`), or an older Python with the `zstandard` package installed.
 - `numpy`, `scipy` (core).
-- Optional, install as needed: `lmdb`, `elasticsearch`, `fastapi`, `uvicorn`, `duckdb`, `psutil`.
+- Optional features are packaged as extras: `lmdb`, `es`, `duckdb`, `server`, `psutil`, `all`, and `dev`.
 
 ```bash
-pip install -r requirements.txt
+# core only
+pip install -e .
+
+# with optional backends / the TRAPI server / test deps
+pip install -e ".[lmdb]"      # LMDB metadata backend
+pip install -e ".[es]"        # Elasticsearch backend
+pip install -e ".[server]"    # FastAPI TRAPI server
+pip install -e ".[all]"       # everything
+pip install -e ".[dev]"       # test dependencies (pytest, ...)
 ```
 
 ## Quick start

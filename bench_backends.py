@@ -87,7 +87,10 @@ class _Tee(io.TextIOBase):
 # ---------------------------------------------------------------------------
 # Default data path
 # ---------------------------------------------------------------------------
-_DEFAULT_ARCHIVE = Path.home() / "prj/mcp/kgquery/csrgraph/data/dgidb.tar.zst"
+_DEFAULT_DATA_DIR = Path(
+    os.environ.get("CSRGRAPH_DATA_DIR", "~/tmp/csrgraph_data")
+).expanduser()
+_DEFAULT_ARCHIVE = _DEFAULT_DATA_DIR / "dgidb.tar.zst"
 
 # ---------------------------------------------------------------------------
 # Helpers

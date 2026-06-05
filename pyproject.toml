@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "csrgraph"
+version = "0.1.0"
+description = "Memory-efficient CSR-backed knowledge graph for Biolink/Translator data, with KGX loading, pluggable metadata backends, path-finding, and a TRAPI server."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Chunlei Wu", email = "cwu@scripps.edu" }]
+keywords = ["knowledge-graph", "biolink", "translator", "trapi", "kgx", "csr"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    # The stdlib `compression.zstd` is used on Python >= 3.14; older versions
+    # need the third-party package for save/load and .tar.zst archives.
+    "zstandard; python_version < '3.14'",
+]
+
+[project.optional-dependencies]
+lmdb = ["lmdb"]
+es = ["elasticsearch"]
+duckdb = ["duckdb"]
+server = ["fastapi", "uvicorn"]
+psutil = ["psutil"]
+all = ["lmdb", "elasticsearch", "duckdb", "fastapi", "uvicorn", "psutil"]
+dev = ["pytest", "lmdb", "fastapi", "httpx"]
+
+[project.urls]
+Homepage = "https://github.com/newgene/csrgraph"
+Repository = "https://github.com/newgene/csrgraph"
+
+[tool.setuptools]
+py-modules = ["csrgraph_kgx", "metadata_db", "trapi", "trapi_server", "bench_backends"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

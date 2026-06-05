@@ -1,11 +1,15 @@
+# Core runtime dependencies.
+# This file mirrors [project.dependencies] in pyproject.toml; for optional
+# features install the corresponding extra instead, e.g.:
+#   pip install -e ".[lmdb]"      # LMDB metadata backend
+#   pip install -e ".[es]"        # Elasticsearch backend
+#   pip install -e ".[duckdb]"    # DuckDB backend
+#   pip install -e ".[server]"    # FastAPI TRAPI server
+#   pip install -e ".[all]"       # everything above
+#   pip install -e ".[dev]"       # test dependencies (pytest, ...)
+
 numpy
 scipy
 
-# Optional (install as needed):
-# zstandard  # only needed on Python < 3.14; built-in compression.zstd is used on 3.14+
-lmdb               # LMDBMetadataBackend / HybridMetadataBackend
-elasticsearch       # ElasticsearchMetadataBackend / HybridMetadataBackend
-fastapi             # trapi_server.py
-uvicorn             # trapi_server.py
-# duckdb           # DuckDBMetadataBackend (uncomment if needed)
-# psutil           # More accurate RAM detection for set_memory_limit("auto")
+# Needed only on Python < 3.14; the stdlib `compression.zstd` is used on 3.14+.
+zstandard; python_version < "3.14"
