@@ -36,9 +36,11 @@ import argparse
 import os
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Query
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 # Ensure sibling modules are importable when run as a script.
@@ -58,6 +60,10 @@ if _env_file.exists():
 
 _DEFAULT_DATA_DIR = Path(os.environ.get("DATA_DIR", "~/tmp/csrgraph_data")).expanduser()
 
+# Maximum number of results a single query may request.
+_MAX_LIMIT = 1000
+_DEFAULT_LIMIT = 100
+
 from csrgraph_kgx import CSRGraph
 from metadata_db import (
     ElasticsearchMetadataBackend,
@@ -70,15 +76,34 @@ from trapi import display_query_graph, query
 # App setup
 # ---------------------------------------------------------------------------
 
+# Graph and DB are loaded once at startup (populated in main / lifespan).
+_graph: CSRGraph | None = None
+_db: HybridMetadataBackend | None = None
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Load the graph on startup when not already loaded by ``main()``.
+
+    This makes ``uvicorn trapi_server:app`` work without calling ``main()``:
+    configuration is taken from environment variables (DATA_DIR, GRAPH_NAME,
+    ES_HOST, NO_ES).  When ``main()`` has already populated ``_graph`` this is
+    a no-op.
+    """
+    if _graph is None:
+        graph_name = os.environ.get("GRAPH_NAME", "translator_kg")
+        es_host = os.environ.get("ES_HOST", "http://localhost:9200")
+        no_es = os.environ.get("NO_ES", "").lower() in {"1", "true", "yes"}
+        _load_graph(_DEFAULT_DATA_DIR, graph_name, es_host=es_host, no_es=no_es)
+    yield
+
+
 app = FastAPI(
     title="CSRGraph TRAPI Server",
     description="Internal test server for TRAPI queries against the Translator KG.",
     version="0.1.0",
+    lifespan=_lifespan,
 )
-
-# Graph and DB are loaded once at startup (populated in main / lifespan).
-_graph: CSRGraph | None = None
-_db: HybridMetadataBackend | None = None
 
 
 def _load_graph(
@@ -810,25 +835,63 @@ async def trapi_query(
     When ``?summary=true``, returns a plain-text summary showing the
     ASCII query graph visualization and a compact result listing.
     """
-    # Extract query_graph from the TRAPI envelope.
-    message = body.get("message", body)
-    query_graph = message.get("query_graph")
-
-    if not query_graph:
+    if _graph is None:
         return JSONResponse(
-            status_code=400,
-            content={"error": "missing message.query_graph"},
+            status_code=503,
+            content={"error": "graph not loaded"},
         )
 
-    # Optional limit from the request body (default 100).
-    limit = body.get("limit", 100)
+    if not isinstance(body, dict):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "request body must be a JSON object"},
+        )
+
+    # Extract query_graph from the TRAPI envelope.
+    message = body.get("message", body)
+    query_graph = message.get("query_graph") if isinstance(message, dict) else None
+
+    if not isinstance(query_graph, dict) or not query_graph:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "missing or invalid message.query_graph"},
+        )
+    if not isinstance(query_graph.get("nodes"), dict) or not isinstance(
+        query_graph.get("edges"), dict
+    ):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "query_graph must contain 'nodes' and 'edges' objects"},
+        )
+
+    # Optional limit from the request body; coerce and clamp to a safe range
+    # to prevent resource-exhaustion via huge or malformed values.
+    try:
+        limit = int(body.get("limit", _DEFAULT_LIMIT))
+    except (TypeError, ValueError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "'limit' must be an integer"},
+        )
+    limit = max(1, min(limit, _MAX_LIMIT))
 
     # Log the query to stdout.
     print(f"\n--- TRAPI query (limit={limit}) ---")
     print(display_query_graph(query_graph))
 
     t0 = time.time()
-    result_message = query(_graph, query_graph, limit=limit)
+    try:
+        # Run the synchronous, CPU/IO-heavy query off the event loop so it
+        # does not block other requests (incl. /health).
+        result_message = await run_in_threadpool(
+            query, _graph, query_graph, limit=limit
+        )
+    except Exception as exc:
+        print(f"  -> query failed: {type(exc).__name__}: {exc}")
+        return JSONResponse(
+            status_code=400,
+            content={"error": "query failed", "detail": str(exc)},
+        )
     elapsed_ms = (time.time() - t0) * 1000
 
     n_results = len(result_message["results"])
@@ -899,8 +962,10 @@ def _format_summary(
 
 
 @app.get("/meta")
-async def meta() -> dict:
+async def meta():
     """Return basic graph metadata."""
+    if _graph is None:
+        return JSONResponse(status_code=503, content={"error": "graph not loaded"})
     return {
         "num_nodes": _graph.num_nodes,
         "edge_count": _graph.edge_count,

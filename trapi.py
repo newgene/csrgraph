@@ -1005,6 +1005,11 @@ def _build_message(
     db = graph.db
     kg_nodes: dict[str, dict] = {}
     kg_edges: dict[str, dict] = {}
+    # Map each distinct (subject, predicate, object) to a stable, unique edge
+    # id.  A delimiter-joined string ("subj-pred-obj") is unsafe because CURIEs
+    # and predicates contain hyphens, so distinct edges could collide and
+    # overwrite each other; keying on the tuple avoids that entirely.
+    edge_id_by_tuple: dict[tuple[str, str, str], str] = {}
     results: list[dict] = []
 
     for binding in bindings:
@@ -1018,10 +1023,13 @@ def _build_message(
 
         for ek, edge_tuple in binding["edges"].items():
             subj, pred, obj = edge_tuple
-            edge_id = f"{subj}-{pred}-{obj}"
-            edge_bindings[ek] = [{"id": edge_id, "attributes": []}]
-            if edge_id not in kg_edges:
+            key = (subj, pred, obj)
+            edge_id = edge_id_by_tuple.get(key)
+            if edge_id is None:
+                edge_id = f"e{len(edge_id_by_tuple)}"
+                edge_id_by_tuple[key] = edge_id
                 kg_edges[edge_id] = _make_kg_edge(db, subj, pred, obj)
+            edge_bindings[ek] = [{"id": edge_id, "attributes": []}]
 
         results.append({
             "node_bindings": node_bindings,
