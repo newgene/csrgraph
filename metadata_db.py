@@ -20,7 +20,9 @@ import json
 import os
 import sqlite3
 import tarfile
+import threading
 import time
+import warnings
 import zlib
 from pathlib import Path
 from typing import Any, Optional
@@ -121,6 +123,15 @@ def _decompress_blob(value: bytes | str | None) -> dict:
             try:
                 return json.loads(zlib.decompress(value))   # legacy zlib fallback
             except Exception:
+                # Neither codec could decode the blob: this indicates genuine
+                # corruption/truncation, not an empty record.  Warn instead of
+                # silently masking it as "no metadata".
+                warnings.warn(
+                    "Failed to decompress/decode a metadata blob; "
+                    "returning empty dict. The store may be corrupt.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
                 return {}
     return json.loads(value)   # legacy uncompressed TEXT column
 
@@ -337,26 +348,52 @@ class SQLiteMetadataBackend(MetadataBackend):
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
-        self._con = sqlite3.connect(db_path, check_same_thread=False)
-        self._con.row_factory = sqlite3.Row
+        # SQLite connections are not safe to share across threads.  Hand each
+        # thread its own connection (lazily) so a threaded server (e.g. the
+        # TRAPI server) can query concurrently without "recursive use of
+        # cursors" errors or interleaved results.
+        self._local = threading.local()
+        self._all_conns: list[sqlite3.Connection] = []
+        self._conns_lock = threading.Lock()
         self._indexed_node_fields: list[str] = []
         self._indexed_edge_fields: list[str] = []
         try:
-            row = self._con.execute(
+            con = self._conn()
+            row = con.execute(
                 "SELECT value FROM _meta WHERE key='indexed_node_fields'"
             ).fetchone()
             if row:
                 self._indexed_node_fields = json.loads(row[0])
-            row = self._con.execute(
+            row = con.execute(
                 "SELECT value FROM _meta WHERE key='indexed_edge_fields'"
             ).fetchone()
             if row:
                 self._indexed_edge_fields = json.loads(row[0])
-        except Exception:
+        except sqlite3.OperationalError:
+            # Fresh/partly-built DB without the _meta table — leave the
+            # indexed-field lists empty.  Other errors propagate.
             pass
 
+    def _conn(self) -> sqlite3.Connection:
+        """Return this thread's SQLite connection, opening one if needed."""
+        con = getattr(self._local, "con", None)
+        if con is None:
+            con = sqlite3.connect(self.db_path, check_same_thread=False)
+            con.row_factory = sqlite3.Row
+            self._local.con = con
+            with self._conns_lock:
+                self._all_conns.append(con)
+        return con
+
     def close(self) -> None:
-        self._con.close()
+        with self._conns_lock:
+            for con in self._all_conns:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+            self._all_conns.clear()
+        self._local = threading.local()
 
     # -- Build ---------------------------------------------------------------
 
@@ -402,14 +439,8 @@ class SQLiteMetadataBackend(MetadataBackend):
         if Path(db_path).exists():
             os.remove(db_path)
 
-        db  = cls.__new__(cls)
-        db.db_path = db_path
-        db._con = sqlite3.connect(db_path, check_same_thread=False)
-        db._con.row_factory = sqlite3.Row
-        db._indexed_node_fields = inodes
-        db._indexed_edge_fields = iedges
-
-        con = db._con
+        con = sqlite3.connect(db_path, check_same_thread=False)
+        con.row_factory = sqlite3.Row
         con.executescript(_make_sqlite_schema(inodes, iedges))
 
         # Write indexed field lists to _meta
@@ -512,17 +543,18 @@ class SQLiteMetadataBackend(MetadataBackend):
 
         con.execute("PRAGMA wal_checkpoint(FULL)")
         con.execute("VACUUM")
+        con.close()
 
         elapsed = time.time() - t0
         size_mb = Path(db_path).stat().st_size / 1024**2
         print(f"Done: {node_count:,} nodes, {edge_count:,} edges, {size_mb:.1f} MB, {elapsed:.1f}s")
-        return db
+        return cls(db_path)
 
     # -- Single-item lookups -------------------------------------------------
 
     def get_node(self, node_id: str) -> dict:
         extra_cols = "".join(f", n.{f}" for f in self._indexed_node_fields)
-        row = self._con.execute(
+        row = self._conn().execute(
             f"SELECT n.id, n.name{extra_cols}, n.extra, "
             f"GROUP_CONCAT(nc.category) AS categories "
             f"FROM nodes n "
@@ -533,7 +565,7 @@ class SQLiteMetadataBackend(MetadataBackend):
         return self._node_row(row) if row else {}
 
     def get_edge(self, subject: str, predicate: str, obj: str) -> dict:
-        row = self._con.execute(
+        row = self._conn().execute(
             "SELECT * FROM edges WHERE subject=? AND predicate=? AND object=?",
             (subject, _strip_biolink(predicate), obj),
         ).fetchone()
@@ -568,7 +600,7 @@ class SQLiteMetadataBackend(MetadataBackend):
                     python_filters[k] = v
 
         extra_cols = "".join(f", n.{f}" for f in self._indexed_node_fields)
-        rows = self._con.execute(
+        rows = self._conn().execute(
             f"SELECT n.id, n.name{extra_cols}, n.extra, "
             f"GROUP_CONCAT(nc.category) AS categories "
             f"FROM nodes n "
@@ -627,7 +659,7 @@ class SQLiteMetadataBackend(MetadataBackend):
 
         if has_pred:
             ph = ",".join("(?,?,?)" for _ in has_pred)
-            for row in self._con.execute(
+            for row in self._conn().execute(
                 f"SELECT * FROM edges WHERE (subject,predicate,object) IN (VALUES {ph}){sql_suffix}",
                 [v for t in has_pred for v in t] + suffix_params,
             ):
@@ -640,7 +672,7 @@ class SQLiteMetadataBackend(MetadataBackend):
 
         if no_pred:
             ph = ",".join("(?,?)" for _ in no_pred)
-            for row in self._con.execute(
+            for row in self._conn().execute(
                 f"SELECT * FROM edges WHERE (subject,object) IN (VALUES {ph}){sql_suffix}",
                 [v for t in no_pred for v in t] + suffix_params,
             ):
@@ -754,6 +786,15 @@ class DuckDBMetadataBackend(MetadataBackend):
 
     def close(self) -> None:
         self._con.close()
+
+    def _q(self):
+        """Return a per-call cursor safe to use from any thread.
+
+        A single DuckDB connection is not safe for concurrent use; ``cursor()``
+        returns a new object sharing the same database that can be used
+        independently, so a threaded server can query concurrently.
+        """
+        return self._con.cursor()
 
     @classmethod
     def build(
@@ -928,13 +969,13 @@ class DuckDBMetadataBackend(MetadataBackend):
         return f"SELECT subject, predicate, object, knowledge_level, agent_type{extra}, extra FROM edges"
 
     def get_node(self, node_id: str) -> dict:
-        rows = self._con.execute(
+        rows = self._q().execute(
             f"{self._node_select()} WHERE id = ?", [node_id]
         ).fetchall()
         return self._node_row(rows[0]) if rows else {}
 
     def get_edge(self, subject: str, predicate: str, obj: str) -> dict:
-        rows = self._con.execute(
+        rows = self._q().execute(
             f"{self._edge_select()} WHERE subject=? AND predicate=? AND object=?",
             [subject, _strip_biolink(predicate), obj],
         ).fetchall()
@@ -967,7 +1008,7 @@ class DuckDBMetadataBackend(MetadataBackend):
                 else:
                     python_filters[k] = v
 
-        rows = self._con.execute(
+        rows = self._q().execute(
             f"{self._node_select()} WHERE {where}",
             params,
         ).fetchall()
@@ -1021,7 +1062,7 @@ class DuckDBMetadataBackend(MetadataBackend):
         if has_pred:
             ph     = ",".join("(?,?,?)" for _ in has_pred)
             params = [v for t in has_pred for v in t] + suffix_params
-            for row in self._con.execute(
+            for row in self._q().execute(
                 f"{sel} WHERE (subject,predicate,object) IN (VALUES {ph}){suffix}",
                 params,
             ).fetchall():
@@ -1035,7 +1076,7 @@ class DuckDBMetadataBackend(MetadataBackend):
         if no_pred:
             ph     = ",".join("(?,?)" for _ in no_pred)
             params = [v for t in no_pred for v in t] + suffix_params
-            for row in self._con.execute(
+            for row in self._q().execute(
                 f"{sel} WHERE (subject,object) IN (VALUES {ph}){suffix}",
                 params,
             ).fetchall():
@@ -1484,6 +1525,7 @@ class ElasticsearchMetadataBackend(MetadataBackend):
         *,
         connections_per_node: int = 10,
         request_timeout: float = 120.0,
+        max_edges_per_pair: int = 100,
     ) -> None:
         """Connect to an Elasticsearch cluster.
 
@@ -1495,13 +1537,26 @@ class ElasticsearchMetadataBackend(MetadataBackend):
             Per-request timeout in seconds (default: 120).  Raise this when
             bulk-indexing large archives whose individual HTTP requests exceed
             the default 10-second elastic-transport timeout.
+        max_edges_per_pair:
+            Maximum number of edge documents fetched per (subject, predicate,
+            object) / (subject, object) match in :meth:`filter_edges`
+            (default: 100).  The previous fixed value of 10 silently dropped
+            edges for node pairs connected by more than 10 stored edges
+            (e.g. multiple knowledge sources).  Raise for densely
+            multi-sourced graphs; bounded by Elasticsearch's
+            ``index.max_result_window``.
         """
+        self._max_edges_per_pair = max(1, max_edges_per_pair)
         try:
             from elasticsearch import Elasticsearch  # type: ignore[import]
             self._es = Elasticsearch(
                 host,
                 connections_per_node=connections_per_node,
                 request_timeout=request_timeout,
+                # Retry transient failures (timeouts, 429s) instead of letting
+                # them surface as permanent errors.
+                retry_on_timeout=True,
+                max_retries=3,
             )
         except ImportError:
             raise ImportError(
@@ -1697,18 +1752,24 @@ class ElasticsearchMetadataBackend(MetadataBackend):
     # -- Single-item lookups -------------------------------------------------
 
     def get_node(self, node_id: str) -> dict:
+        from elasticsearch import NotFoundError  # type: ignore[import]
+
         try:
             resp = self._es.get(index=self._nodes_idx, id=node_id)
             return self._normalise_node(resp["_source"])
-        except Exception:
+        except NotFoundError:
+            # Genuinely absent — distinct from a connection/transport error,
+            # which we deliberately let propagate rather than mask as "{}".
             return {}
 
     def get_edge(self, subject: str, predicate: str, obj: str) -> dict:
+        from elasticsearch import NotFoundError  # type: ignore[import]
+
         eid = f"{subject}|{_strip_biolink(predicate)}|{obj}"
         try:
             resp = self._es.get(index=self._edges_idx, id=eid)
             return self._normalise_edge(resp["_source"])
-        except Exception:
+        except NotFoundError:
             return {}
 
     # -- Bulk filtering ------------------------------------------------------
@@ -1776,8 +1837,11 @@ class ElasticsearchMetadataBackend(MetadataBackend):
         # ── Known-predicate edges: msearch (one HTTP round-trip per batch) ───
         # ES processes all sub-queries in parallel server-side.
         # Batch to avoid exceeding msearch limits on very large edge lists.
+        per_pair = self._max_edges_per_pair
         if has_pred:
-            _MSEARCH_BATCH = self._ES_MAX_RESULT_WINDOW
+            # Keep each msearch's worst-case total hits within the result
+            # window: batch_size * per_pair <= _ES_MAX_RESULT_WINDOW.
+            _MSEARCH_BATCH = max(1, self._ES_MAX_RESULT_WINDOW // per_pair)
             for batch_start in range(0, len(has_pred), _MSEARCH_BATCH):
                 batch = has_pred[batch_start : batch_start + _MSEARCH_BATCH]
                 searches: list[dict] = []
@@ -1795,7 +1859,7 @@ class ElasticsearchMetadataBackend(MetadataBackend):
                         for k, v in extra_filters.items():
                             must.append({"term": {k: str(v)}})
                     searches.append({"index": self._edges_idx})
-                    searches.append({"query": {"bool": {"must": must}}, "size": 10})
+                    searches.append({"query": {"bool": {"must": must}}, "size": per_pair})
                 resp = self._es.msearch(searches=searches)
                 for r in resp["responses"]:
                     for hit in r.get("hits", {}).get("hits", []):
@@ -1805,9 +1869,9 @@ class ElasticsearchMetadataBackend(MetadataBackend):
         # Batched in chunks so that neither the ``should`` clause count nor
         # ``size`` exceeds ``_ES_MAX_RESULT_WINDOW``.
         if no_pred:
-            # Each (subject, object) pair may yield up to ~10 edges, so we
-            # limit chunks so that chunk_len * 10 <= _ES_MAX_RESULT_WINDOW.
-            _SHOULD_CHUNK = max(1, self._ES_MAX_RESULT_WINDOW // 10)
+            # Each (subject, object) pair may yield up to per_pair edges, so we
+            # limit chunks so that chunk_len * per_pair <= _ES_MAX_RESULT_WINDOW.
+            _SHOULD_CHUNK = max(1, self._ES_MAX_RESULT_WINDOW // per_pair)
             for batch_start in range(0, len(no_pred), _SHOULD_CHUNK):
                 batch = no_pred[batch_start : batch_start + _SHOULD_CHUNK]
                 should: list[dict] = []
@@ -1827,7 +1891,7 @@ class ElasticsearchMetadataBackend(MetadataBackend):
                 resp = self._es.search(
                     index=self._edges_idx,
                     query={"bool": {"should": should, "minimum_should_match": 1}},
-                    size=len(batch) * 10,
+                    size=min(len(batch) * per_pair, self._ES_MAX_RESULT_WINDOW),
                 )
                 for hit in resp["hits"]["hits"]:
                     results.append(self._normalise_edge(hit["_source"]))
