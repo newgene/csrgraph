@@ -1,0 +1,11 @@
+numpy
+scipy
+
+# Optional (install as needed):
+# zstandard  # only needed on Python < 3.14; built-in compression.zstd is used on 3.14+
+lmdb               # LMDBMetadataBackend / HybridMetadataBackend
+elasticsearch       # ElasticsearchMetadataBackend / HybridMetadataBackend
+fastapi             # trapi_server.py
+uvicorn             # trapi_server.py
+# duckdb           # DuckDBMetadataBackend (uncomment if needed)
+# psutil           # More accurate RAM detection for set_memory_limit("auto")

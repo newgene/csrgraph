@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / cached files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Generated graph / metadata stores
+*.lmdb/
+*.sqlite
+*.duckdb
+*.pkl
+*.pkl.zst
+
+# Generated query output / scratch
+csr_test_result.json
+mg_test.html
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
