@@ -83,3 +83,7 @@ Run `python trapi_server.py --help` for all options (`--es-host`, `--host`, `--p
 ```bash
 pytest
 ```
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
