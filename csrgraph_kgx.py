@@ -497,7 +497,7 @@ class CSRGraph:
 
         suffix = "".join(archive.suffixes)
 
-        tar = cls._open_tar(archive, suffix)
+        tar, _closeables = cls._open_tar(archive, suffix)
 
         # ------------------------------------------------------------------
         # Streaming parse – we iterate over tar members once.  For the
@@ -509,7 +509,7 @@ class CSRGraph:
         node_meta: Dict[str, dict] = {}
         edge_meta: Dict[Tuple[str, str, str], dict] = {}
 
-        with tar:
+        try:
             for member in tar:
                 basename = Path(member.name).name
                 fobj = tar.extractfile(member)
@@ -573,6 +573,13 @@ class CSRGraph:
                                 if key in node:
                                     filtered_node[key] = node[key]
                         node_meta[nid] = filtered_node
+        finally:
+            tar.close()
+            for _c in _closeables:
+                try:
+                    _c.close()
+                except Exception:
+                    pass
 
         if not triples:
             raise ValueError(
@@ -748,10 +755,16 @@ class CSRGraph:
         if _BUILTIN_ZSTD:
             raw = _zstd.decompress(compressed)
         else:
+            import io
             import typing as _t
 
+            # Stream-decompress: the uncompressed size is unknown and pickled
+            # numpy/CSR data often compresses far beyond any fixed multiple of
+            # the compressed size, so a bounded ``decompress(max_output_size=)``
+            # would raise on highly compressible graphs.
             dctx: _t.Any = _zstd.ZstdDecompressor()
-            raw = dctx.decompress(compressed, max_output_size=len(compressed) * 20)
+            with dctx.stream_reader(io.BytesIO(compressed)) as reader:
+                raw = reader.read()
 
         graph: CSRGraph = pickle.loads(raw)
         elapsed = time.time() - t0
@@ -1477,6 +1490,15 @@ class CSRGraph:
 
         *relation* may include or omit the ``biolink:`` prefix.
 
+        .. note::
+            When *relation* is ``None`` the path runs over the merged graph,
+            which stores only a single *representative* predicate per directed
+            node pair.  For multigraphs (multiple predicates between the same
+            two nodes) the reported predicate is one of them, not necessarily
+            the only one.  Pass an explicit *relation* to traverse a specific
+            predicate, or use :meth:`edges_between` to enumerate all predicates
+            between two nodes.
+
         Parameters
         ----------
         node_subclassing:
@@ -1543,6 +1565,10 @@ class CSRGraph:
         """Return **all** shortest paths from *source* to *target*.
 
         *relation* may include or omit the ``biolink:`` prefix.
+
+        .. note::
+            With *relation* ``None`` the merged graph reports a single
+            representative predicate per node pair; see :meth:`shortest_path`.
 
         Parameters
         ----------
@@ -1649,7 +1675,7 @@ class CSRGraph:
 
         results: List[List[PathEdge]] = []
 
-        def dfs(depth: int, current: int, path: List[int]) -> None:
+        def dfs(depth: int, current: int, path: List[int], visited: set[int]) -> None:
             if depth == len(seq):
                 if current in tgt_ids:
                     edge_path: List[PathEdge] = []
@@ -1668,12 +1694,20 @@ class CSRGraph:
 
             rel = seq[depth]
             for nxt in self._neighbor_ids(current, relation=rel):
-                path.append(int(nxt))
-                dfs(depth + 1, int(nxt), path)
+                nxt = int(nxt)
+                # Enforce simple paths: never revisit a node already on the
+                # current path, otherwise self-loops / cycles produce
+                # infinite or combinatorially exploding results.
+                if nxt in visited:
+                    continue
+                path.append(nxt)
+                visited.add(nxt)
+                dfs(depth + 1, nxt, path, visited)
+                visited.remove(nxt)
                 path.pop()
 
         for sid in src_ids:
-            dfs(0, sid, [sid])
+            dfs(0, sid, [sid], {sid})
 
         return results
 
@@ -1713,9 +1747,9 @@ class CSRGraph:
             - ``None`` — wildcard (any predicate)
 
         limit : int
-            Maximum number of matching paths to return.  The traversal frontier
-            is also capped at *limit* after each hop to prevent combinatorial
-            explosion.
+            Maximum number of matching paths to return.  Only the final hop is
+            capped at *limit*; intermediate frontiers use a larger safety bound
+            so valid branches that reach an endpoint are not pruned early.
         node_subclassing : bool
             When ``True``, any string CURIE *NodeSpec* is expanded to include
             all of its ``subclass_of`` descendants.  Dict/``None`` NodeSpecs
@@ -1775,7 +1809,19 @@ class CSRGraph:
         # frontier: list of (current_node_id, path_edges_so_far)
         frontier: List[tuple[str, List[PathEdge]]] = [(nid, []) for nid in start_nodes]
 
-        for edge_spec, next_node_spec in zip(edge_specs, node_specs[1:]):
+        # Capping an *intermediate* frontier at ``limit`` can prune the only
+        # branches that reach a valid endpoint, silently dropping complete
+        # paths.  So only the final hop is capped at ``limit``; intermediate
+        # hops use a much larger safety bound that still prevents unbounded
+        # combinatorial explosion.
+        n_hops = len(edge_specs)
+        intermediate_cap = max(limit * 50, 50_000)
+
+        for hop, (edge_spec, next_node_spec) in enumerate(
+            zip(edge_specs, node_specs[1:])
+        ):
+            is_last_hop = hop == n_hops - 1
+            hop_cap = limit if is_last_hop else intermediate_cap
             next_frontier: List[tuple[str, List[PathEdge]]] = []
 
             for current_node, path_so_far in frontier:
@@ -1793,9 +1839,9 @@ class CSRGraph:
                     next_frontier.append(
                         (nbr, path_so_far + [(current_node, pred, nbr)])
                     )
-                    if len(next_frontier) >= limit:
+                    if len(next_frontier) >= hop_cap:
                         break
-                if len(next_frontier) >= limit:
+                if len(next_frontier) >= hop_cap:
                     break
 
             frontier = next_frontier
@@ -1809,8 +1855,14 @@ class CSRGraph:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _open_tar(archive: Path, suffix: str) -> tarfile.TarFile:
-        """Open a (possibly compressed) tar archive in streaming mode."""
+    def _open_tar(archive: Path, suffix: str) -> Tuple[tarfile.TarFile, List]:
+        """Open a (possibly compressed) tar archive in streaming mode.
+
+        Returns ``(tarfile, extra_closeables)``.  For the ``.tar.zst`` formats
+        ``tarfile`` is wrapped around an externally-opened stream that it will
+        **not** close itself, so the underlying file/reader objects are
+        returned in *extra_closeables* for the caller to close.
+        """
         if suffix.endswith(".tar.zst"):
             if _zstd is None:
                 raise ImportError(
@@ -1820,19 +1872,27 @@ class CSRGraph:
             if _BUILTIN_ZSTD:
                 # compression.zstd.open returns a file-like object
                 zf = _zstd.open(archive, "rb")
-                return tarfile.open(fileobj=zf, mode="r|")
+                try:
+                    return tarfile.open(fileobj=zf, mode="r|"), [zf]
+                except Exception:
+                    zf.close()
+                    raise
             else:
                 # zstandard (third-party): use stream_reader
                 import typing as _t
 
                 fh = open(archive, "rb")
-                dctx: _t.Any = _zstd.ZstdDecompressor()
-                reader = dctx.stream_reader(fh)
-                return tarfile.open(fileobj=reader, mode="r|")
+                try:
+                    dctx: _t.Any = _zstd.ZstdDecompressor()
+                    reader = dctx.stream_reader(fh)
+                    return tarfile.open(fileobj=reader, mode="r|"), [reader, fh]
+                except Exception:
+                    fh.close()
+                    raise
         elif suffix.endswith((".tar.gz", ".tgz")):
-            return tarfile.open(archive, mode="r:gz")
+            return tarfile.open(archive, mode="r:gz"), []
         elif suffix.endswith(".tar"):
-            return tarfile.open(archive, mode="r:")
+            return tarfile.open(archive, mode="r:"), []
         else:
             raise ValueError(
                 f"Unsupported archive format: {suffix}. "
