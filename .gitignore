@@ -32,6 +32,12 @@ htmlcov/
 csr_test_result.json
 mg_test.html
 
+# Generated audit reports (predicate_audit.py output)
+*predicate_audit*.html
+
+# Local Claude Code harness state
+.claude/
+
 # Editor / OS
 .DS_Store
 .idea/
