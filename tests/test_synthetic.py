@@ -103,6 +103,20 @@ def test_shortest_path():
     assert len(path) == 2
 
 
+def test_non_biolink_predicate_not_double_prefixed():
+    # A non-biolink CURIE predicate (e.g. rdfs:subClassOf) must round-trip
+    # unchanged, not become "biolink:rdfs:subClassOf".
+    g = CSRGraph([
+        ("CHEBI:1", "rdfs:subClassOf", "CHEBI:2"),
+        ("CHEBI:1", "biolink:affects", "NCBIGene:1"),
+    ])
+    assert set(g.edges_between("CHEBI:1", "CHEBI:2")) == {"rdfs:subClassOf"}
+    assert set(g.edges_between("CHEBI:1", "NCBIGene:1")) == {"biolink:affects"}
+    # querying by the non-biolink predicate works
+    sp = g.shortest_path("CHEBI:1", "CHEBI:2", relation="rdfs:subClassOf")
+    assert sp == [("CHEBI:1", "rdfs:subClassOf", "CHEBI:2")]
+
+
 def test_paths_by_predicate_sequence_is_simple():
     # Add a cycle; the sequence search must not loop forever / emit cycles.
     g = CSRGraph([

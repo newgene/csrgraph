@@ -38,11 +38,11 @@ from trapi import SYMMETRIC_PREDICATES
 # a mutual A<->B pair or a self-loop is almost certainly a data error.
 # Predicates that encode the class hierarchy: mutual pairs are cycles and
 # self-loops are reflexive-subclass errors (both high severity).
-HIERARCHY = {"biolink:subclass_of", "biolink:rdfs:subClassOf", "biolink:superclass_of"}
+HIERARCHY = {"biolink:subclass_of", "rdfs:subClassOf", "biolink:superclass_of"}
 
 ANTISYMMETRIC = {
     "biolink:subclass_of",
-    "biolink:rdfs:subClassOf",
+    "rdfs:subClassOf",
     "biolink:superclass_of",
     "biolink:part_of",
     "biolink:has_part",

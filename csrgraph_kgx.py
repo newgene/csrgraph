@@ -103,8 +103,14 @@ def _strip_biolink(value: str) -> str:
 
 
 def _add_biolink(value: str) -> str:
-    """Ensure the ``biolink:`` prefix is present."""
-    if value.startswith(BIOLINK_PREFIX):
+    """Restore the ``biolink:`` prefix on a value stripped by ``_strip_biolink``.
+
+    Only bare values (no namespace) get the prefix.  Values that already carry
+    a namespace — ``biolink:...`` *or* another CURIE prefix such as
+    ``rdfs:subClassOf`` — are returned unchanged, so non-biolink predicates are
+    not corrupted into ``biolink:rdfs:subClassOf``.
+    """
+    if ":" in value:
         return value
     return BIOLINK_PREFIX + value
 
