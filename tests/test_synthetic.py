@@ -103,6 +103,18 @@ def test_shortest_path():
     assert len(path) == 2
 
 
+def test_add_biolink_preserves_other_namespaces():
+    # Both modules' _add_biolink must prefix only bare values, leaving
+    # already-namespaced CURIEs (biolink: or rdfs:/owl:/...) unchanged.
+    from csrgraph_kgx import _add_biolink as add_g
+    from metadata_db import _add_biolink as add_db
+    for add in (add_g, add_db):
+        assert add("affects") == "biolink:affects"
+        assert add("biolink:affects") == "biolink:affects"
+        assert add("rdfs:subClassOf") == "rdfs:subClassOf"
+        assert add("owl:sameAs") == "owl:sameAs"
+
+
 def test_non_biolink_predicate_not_double_prefixed():
     # A non-biolink CURIE predicate (e.g. rdfs:subClassOf) must round-trip
     # unchanged, not become "biolink:rdfs:subClassOf".

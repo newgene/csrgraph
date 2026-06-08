@@ -56,7 +56,11 @@ _BIOLINK_PREFIX = "biolink:"
 
 
 def _add_biolink(s: str) -> str:
-    return s if s.startswith(_BIOLINK_PREFIX) else _BIOLINK_PREFIX + s
+    # Only prefix bare values; values already carrying a namespace (biolink:
+    # or another CURIE prefix such as rdfs:subClassOf) round-trip unchanged,
+    # so non-biolink predicates/categories aren't corrupted into
+    # "biolink:rdfs:subClassOf".
+    return s if ":" in s else _BIOLINK_PREFIX + s
 
 
 def _strip_biolink(s: str) -> str:
