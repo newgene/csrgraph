@@ -1263,25 +1263,54 @@ class CSRGraph:
     # Subclass-of expansion helpers
     # ------------------------------------------------------------------
 
-    def _get_subclass_of_T(self) -> Optional[csr_matrix]:
-        """Lazily compute and cache the transpose of ``csr_by_relation["subclass_of"]``.
+    #: Predicates treated as semantic "is-a" / subtype links for node
+    #: subclassing.  The canonical biolink form is ``biolink:subclass_of``
+    #: (stored stripped as ``subclass_of``).  Some current releases of
+    #: translator_kg instead emit the raw ``rdfs:subClassOf`` CURIE — a known
+    #: data error slated to be normalised back to ``biolink:subclass_of`` in a
+    #: future release.  Both names are listed (canonical first) and every
+    #: present variant is unioned, so ``node_subclassing=True`` works on the
+    #: current graph, on the fixed future graph, and on a mixed transition
+    #: graph alike — no code change needed when the data is corrected.
+    SUBCLASS_PREDICATES: tuple[str, ...] = ("subclass_of", "rdfs:subClassOf")
 
-        The transposed matrix has ``M[parent, child] = 1``, enabling efficient
-        BFS over children/descendants without scanning every edge.  Returns
-        ``None`` when no ``subclass_of`` edges are present in the graph.
+    def _get_subclass_of_T(self) -> Optional[csr_matrix]:
+        """Lazily compute and cache the transpose of the subclass adjacency.
+
+        The subclass edges (``child --subclass_of--> parent``) are taken from
+        every predicate listed in :attr:`SUBCLASS_PREDICATES` that is present
+        in the graph, and unioned.  The transposed matrix has
+        ``M[parent, child] = 1``, enabling efficient BFS over
+        children/descendants without scanning every edge.  Returns ``None``
+        when no subclass edges are present in the graph.
         """
         if not hasattr(self, "_subclass_of_T_cache"):
-            csr = self.csr_by_relation.get("subclass_of")
+            mats = [
+                self.csr_by_relation[p]
+                for p in self.SUBCLASS_PREDICATES
+                if p in self.csr_by_relation
+            ]
+            if not mats:
+                combined: Optional[csr_matrix] = None
+            elif len(mats) == 1:
+                combined = mats[0]
+            else:
+                # Union of all subclass adjacency matrices (binary OR).
+                combined = mats[0].copy()
+                for m in mats[1:]:
+                    combined = combined + m
+                combined = (combined > 0).tocsr()
             self._subclass_of_T_cache: Optional[csr_matrix] = (
-                csr.T.tocsr() if csr is not None else None
+                combined.T.tocsr() if combined is not None else None
             )
         return self._subclass_of_T_cache
 
     def _expand_subclasses(self, node_id: int) -> frozenset[int]:
-        """Return *node_id* plus all descendant IDs reachable via ``subclass_of``.
+        """Return *node_id* plus all descendant IDs reachable via subclass edges.
 
-        BFS on the transposed ``subclass_of`` matrix (parent→children direction).
-        Returns a singleton ``{node_id}`` when no ``subclass_of`` edges exist.
+        BFS on the transposed subclass matrix (parent→children direction), built
+        from every predicate in :attr:`SUBCLASS_PREDICATES` present in the
+        graph.  Returns a singleton ``{node_id}`` when no subclass edges exist.
         """
         T = self._get_subclass_of_T()
         if T is None:

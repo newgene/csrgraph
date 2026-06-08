@@ -439,6 +439,85 @@ class TestNodeSubclassing:
         )
 
 
+class TestRdfsSubClassOfSubclassing:
+    """Subclassing must also follow ``rdfs:subClassOf`` edges, not only the
+    biolink ``subclass_of`` predicate.
+
+    Ontology-derived graphs (e.g. translator_kg) encode the class hierarchy with
+    the raw ``rdfs:subClassOf`` CURIE.  ``CSRGraph.SUBCLASS_PREDICATES`` lists
+    every recognised variant and they are unioned, so ``node_subclassing=True``
+    works regardless of which convention the source KG uses.
+    """
+
+    _PARENT = "MONDO:PARENT"
+    _CHILD = "MONDO:CHILD"
+    _TARGET = "NCBIGene:T1"
+
+    @pytest.fixture(scope="class")
+    def sc_graph(self):
+        from csrgraph_kgx import CSRGraph  # noqa: PLC0415
+
+        triples = [
+            (self._CHILD, "rdfs:subClassOf", self._PARENT),
+            (self._CHILD, "biolink:affects", self._TARGET),
+        ]
+        return CSRGraph(triples)
+
+    def test_rdfs_subclass_predicate_recognised(self, sc_graph):
+        assert "rdfs:subClassOf" in sc_graph.SUBCLASS_PREDICATES
+        u = sc_graph.node_to_id[self._PARENT]
+        expanded = sc_graph._expand_subclasses(u)
+        assert sc_graph.node_to_id[self._CHILD] in expanded
+
+    def test_neighbors_with_rdfs_subclassing(self, sc_graph):
+        nbrs = sc_graph.neighbors(self._PARENT, node_subclassing=True)
+        assert self._TARGET in nbrs
+        # Without subclassing the abstract parent has no affects edge.
+        assert self._TARGET not in sc_graph.neighbors(self._PARENT)
+
+
+class TestSubclassPredicateMigration:
+    """The hierarchy predicate is migrating from the (mistaken) ``rdfs:subClassOf``
+    used in current translator_kg releases back to the canonical
+    ``biolink:subclass_of``.  Subclassing must work for the current graph, the
+    fixed future graph, and a mixed transition graph — all without code changes.
+    """
+
+    _PARENT = "MONDO:PARENT"
+    _CHILD_RDFS = "MONDO:CHILD_RDFS"
+    _CHILD_BIOLINK = "MONDO:CHILD_BIOLINK"
+    _TARGET_RDFS = "NCBIGene:R"
+    _TARGET_BIOLINK = "NCBIGene:B"
+
+    def _graph(self, hierarchy_triples):
+        from csrgraph_kgx import CSRGraph  # noqa: PLC0415
+
+        return CSRGraph(hierarchy_triples + [
+            (self._CHILD_RDFS, "biolink:affects", self._TARGET_RDFS),
+            (self._CHILD_BIOLINK, "biolink:affects", self._TARGET_BIOLINK),
+        ])
+
+    def test_future_biolink_only(self):
+        """Fixed future graph: only ``biolink:subclass_of`` edges."""
+        g = self._graph([
+            (self._CHILD_BIOLINK, "biolink:subclass_of", self._PARENT),
+        ])
+        nbrs = g.neighbors(self._PARENT, node_subclassing=True)
+        assert self._TARGET_BIOLINK in nbrs
+
+    def test_transition_mixed(self):
+        """Mixed graph during migration: both predicates present and unioned."""
+        g = self._graph([
+            (self._CHILD_RDFS, "rdfs:subClassOf", self._PARENT),
+            (self._CHILD_BIOLINK, "biolink:subclass_of", self._PARENT),
+        ])
+        expanded = g._expand_subclasses(g.node_to_id[self._PARENT])
+        assert g.node_to_id[self._CHILD_RDFS] in expanded
+        assert g.node_to_id[self._CHILD_BIOLINK] in expanded
+        nbrs = g.neighbors(self._PARENT, node_subclassing=True)
+        assert {self._TARGET_RDFS, self._TARGET_BIOLINK} <= set(nbrs)
+
+
 class TestMatchPath:
     """match_path() with NodeSpec / EdgeSpec patterns."""
 
