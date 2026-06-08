@@ -32,6 +32,9 @@ htmlcov/
 csr_test_result.json
 mg_test.html
 
+# Generated kg_report.py HTML reports
+*_report.html
+
 # Generated audit reports (predicate_audit.py output)
 *predicate_audit*.html
 
