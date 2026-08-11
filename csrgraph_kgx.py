@@ -1859,27 +1859,70 @@ class CSRGraph:
             hop_cap = limit if is_last_hop else intermediate_cap
             next_frontier: List[tuple[str, List[PathEdge]]] = []
 
-            for current_node, path_so_far in frontier:
-                pairs = _mp_expand_edges(self, current_node, edge_spec)
+            def _flush(pending: List[tuple]) -> List[tuple]:
+                """Metadata-filter one batch of candidate expansions.
+
+                Uses at most one ``filter_edges`` + one ``filter_nodes`` call for
+                the *whole* batch, however many distinct source nodes it spans.
+                """
+                if not pending:
+                    return []
 
                 if isinstance(edge_spec, dict):
-                    pairs = _mp_apply_edge_filter(db, current_node, pairs, edge_spec)
-
-                pairs = _mp_apply_node_filter(
-                    db, pairs, next_node_spec,
-                    graph=self, node_subclassing=node_subclassing,
-                )
-
-                for nbr, pred in pairs:
-                    next_frontier.append(
-                        (nbr, path_so_far + [(current_node, pred, nbr)])
+                    survivors = _mp_filter_edges_batch(
+                        db,
+                        [(cur, pred, nbr) for cur, _p, nbr, pred in pending],
+                        edge_spec,
                     )
+                    pending = [c for c in pending if (c[0], c[3], c[2]) in survivors]
+                    if not pending:
+                        return []
+
+                allowed = _mp_filter_nodes_batch(
+                    db,
+                    [nbr for _c, _p, nbr, _pred in pending],
+                    next_node_spec,
+                    graph=self,
+                    node_subclassing=node_subclassing,
+                )
+                if allowed is not None:
+                    pending = [c for c in pending if c[2] in allowed]
+
+                return [
+                    (nbr, path_so_far + [(cur, pred, nbr)])
+                    for cur, path_so_far, nbr, pred in pending
+                ]
+
+            # Candidate expansions awaiting a batched metadata check, each
+            # ``(current_node, path_so_far, nbr, pred)``.  Filtering a whole
+            # batch in one backend call — rather than once per frontier node —
+            # is what keeps a deep hop affordable: every backend pays a fixed
+            # per-call cost (an Elasticsearch round-trip; an LMDB transaction
+            # plus a full category-index scan), and calling per node multiplies
+            # that cost by the frontier size, which at hop 3+ is the cap.
+            batch: List[tuple] = []
+
+            for current_node, path_so_far in frontier:
+                for nbr, pred in _mp_expand_edges(self, current_node, edge_spec):
+                    batch.append((current_node, path_so_far, nbr, pred))
+
+                # The flush threshold adapts to how many results this hop still
+                # needs.  Always accumulating a full batch would trade per-node
+                # call overhead for wasted expansion: a low ``limit`` satisfied
+                # by the first few high-degree frontier nodes needs far fewer
+                # candidates than ``_MP_FILTER_BATCH``, and expanding them
+                # anyway costs more than the calls it saves.
+                needed = hop_cap - len(next_frontier)
+                if len(batch) >= min(_MP_FILTER_BATCH, max(needed, _MP_MIN_FLUSH)):
+                    next_frontier.extend(_flush(batch))
+                    batch = []
                     if len(next_frontier) >= hop_cap:
                         break
-                if len(next_frontier) >= hop_cap:
-                    break
 
-            frontier = next_frontier
+            if batch and len(next_frontier) < hop_cap:
+                next_frontier.extend(_flush(batch))
+
+            frontier = next_frontier[:hop_cap]
             if not frontier:
                 return []
 
@@ -1938,6 +1981,17 @@ class CSRGraph:
 # ===================================================================
 # match_path traversal helpers  (module-level; called by CSRGraph.match_path)
 # ===================================================================
+
+# Candidate expansions accumulated per hop before they are flushed through the
+# metadata backend in one batched call.  10k matches the Elasticsearch
+# backend's internal id-chunk size, so one flush costs about one round-trip
+# there; for LMDB it amortises one transaction + category scan over the batch.
+_MP_FILTER_BATCH = 10_000
+
+# Floor for the adaptive flush threshold, so a nearly-satisfied hop still batches
+# a useful number of candidates per call instead of degenerating towards one call
+# per frontier node.
+_MP_MIN_FLUSH = 256
 
 
 def _resolve_node_candidates(
@@ -2019,50 +2073,56 @@ def _mp_expand_edges(
     return pairs
 
 
-def _mp_apply_edge_filter(
+def _mp_filter_edges_batch(
     db: MetadataBackend,
-    source: str,
-    pairs: List[tuple],
+    triples: List[PathEdge],
     edge_spec: dict,
-) -> List[tuple]:
-    """Keep only ``(neighbor, predicate)`` pairs whose edge metadata matches *edge_spec*."""
-    if not pairs:
-        return []
-    edges: List[PathEdge] = [(source, pred, nbr) for nbr, pred in pairs]
+) -> set:
+    """Return the ``(subject, predicate, object)`` triples matching *edge_spec*.
+
+    One backend call for the whole batch, however many distinct subjects the
+    triples span.  Both sides of the comparison carry ``biolink:``-prefixed
+    predicates (``_mp_expand_edges`` emits them, and the backends' edge
+    normalisers restore the prefix), so the returned keys line up with the
+    caller's candidates.
+    """
+    if not triples:
+        return set()
     matched = db.filter_edges(
-        edges,
+        triples,
         knowledge_level=edge_spec.get("knowledge_level"),
         agent_type=edge_spec.get("agent_type"),
     )
-    match_set = {(e["predicate"], e["object"]) for e in matched}
-    return [(nbr, pred) for nbr, pred in pairs if (pred, nbr) in match_set]
+    return {(e["subject"], e["predicate"], e["object"]) for e in matched}
 
 
-def _mp_apply_node_filter(
+def _mp_filter_nodes_batch(
     db: MetadataBackend,
-    pairs: List[tuple],
+    node_ids: List[str],
     node_spec: NodeSpec,
     graph: Optional[CSRGraph] = None,
     node_subclassing: bool = False,
-) -> List[tuple]:
-    """Keep only ``(neighbor, predicate)`` pairs whose neighbor satisfies *node_spec*.
+) -> Optional[set]:
+    """Return the subset of *node_ids* satisfying *node_spec*.
 
-    When *node_subclassing* is ``True`` and *node_spec* is a string CURIE,
-    neighbours that are subclasses of that CURIE also pass the filter.
+    Returns ``None`` for a wildcard (``None``) spec, meaning "everything
+    passes" — letting the caller skip the membership test altogether rather
+    than build a set it would only compare against itself.
+
+    String CURIE specs are resolved in memory (optionally widened to subclass
+    descendants when *node_subclassing* is set); only dict specs reach the
+    backend, and then in a single batched call.
     """
-    if not pairs or node_spec is None:
-        return pairs
+    if node_spec is None:
+        return None
     if isinstance(node_spec, str):
         if node_subclassing and graph is not None and node_spec in graph.node_to_id:
             valid_ids = graph._expand_subclasses(graph.node_to_id[node_spec])
-            valid_nodes = {graph.nodes[i] for i in valid_ids}
-            return [(n, p) for n, p in pairs if n in valid_nodes]
-        return [(n, p) for n, p in pairs if n == node_spec]
+            return {graph.nodes[i] for i in valid_ids}
+        return {node_spec}
     # dict filter — subclassing does not apply (category/id filter selects specific nodes)
-    candidate_ids = [n for n, _ in pairs]
-    matched = db.filter_nodes(candidate_ids, category=node_spec.get("category"))
-    match_set = {m["id"] for m in matched}
-    return [(n, p) for n, p in pairs if n in match_set]
+    matched = db.filter_nodes(node_ids, category=node_spec.get("category"))
+    return {m["id"] for m in matched}
 
 
 # ===================================================================
