@@ -390,6 +390,25 @@ class CSRGraph:
     def _edge_key(self, u: int, v: int) -> int:
         return u * self.num_nodes + v
 
+    def _expansion_plan(self) -> List[Tuple[np.ndarray, np.ndarray, str]]:
+        """Per-relation ``(indptr, indices, biolink_label)`` tuples, built once.
+
+        Wildcard neighbour expansion has to visit every relation to keep each
+        edge's true predicate (``csr_merged`` cannot serve this — see
+        ``edge_predicate_ids``, which stores only one representative predicate
+        per node pair).  Precomputing the plan hoists the dict iteration, the
+        ``indptr``/``indices`` attribute lookups, and the ``biolink:`` label
+        construction out of the per-node hot loop.
+        """
+        plan = getattr(self, "_expand_plan_cache", None)
+        if plan is None:
+            plan = [
+                (csr.indptr, csr.indices, _add_biolink(rel))
+                for rel, csr in self.csr_by_relation.items()
+            ]
+            self._expand_plan_cache = plan
+        return plan
+
     def _relation_id_dtype(self) -> np.dtype:
         n = max(len(self.relations), 1)
         if n <= np.iinfo(np.uint8).max:
@@ -2052,6 +2071,8 @@ def _mp_expand_edges(
         return []
     u = graph.node_to_id[node_id]
 
+    nodes = graph.nodes
+
     if isinstance(edge_spec, str):
         rel = _strip_biolink(edge_spec)
         csr = graph.csr_by_relation.get(rel)
@@ -2059,17 +2080,21 @@ def _mp_expand_edges(
             return []
         pred_label = _add_biolink(rel)
         start, end = int(csr.indptr[u]), int(csr.indptr[u + 1])
-        return [
-            (graph.nodes[int(csr.indices[j])], pred_label) for j in range(start, end)
-        ]
+        if start == end:
+            return []
+        return [(nodes[v], pred_label) for v in csr.indices[start:end].tolist()]
 
-    # None or dict: iterate all relations to capture exact predicates
+    # None or dict: visit every relation, since each edge must keep its own
+    # predicate.  Most relations hold no row for a given node (mean degree ~17
+    # spread over dozens of predicates), so the empty-row skip below elides the
+    # large majority of the work.
     pairs: List[tuple] = []
-    for rel, csr in graph.csr_by_relation.items():
-        pred_label = _add_biolink(rel)
-        start, end = int(csr.indptr[u]), int(csr.indptr[u + 1])
-        for j in range(start, end):
-            pairs.append((graph.nodes[int(csr.indices[j])], pred_label))
+    for indptr, indices, pred_label in graph._expansion_plan():
+        start = indptr[u]
+        end = indptr[u + 1]
+        if start == end:
+            continue
+        pairs.extend((nodes[v], pred_label) for v in indices[start:end].tolist())
     return pairs
 
 
