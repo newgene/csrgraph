@@ -270,6 +270,36 @@ class MetadataBackend(abc.ABC):
             Indexed fields use SQL WHERE; others use Python-side filtering.
         """
 
+    def nodes_by_category(
+        self,
+        category: str,
+        *,
+        limit: int | None = None,
+    ) -> list[str]:
+        """Return the CURIEs of every node in *category*.
+
+        Answers "which nodes are Genes?" without the caller having to enumerate
+        candidates first.  ``filter_nodes`` narrows a list the caller already
+        has; this *produces* the list, which is what a category-only query
+        needs.
+
+        Backends with a category index should override this.  The default
+        implementation raises :class:`NotImplementedError` so callers can detect
+        the absence and fall back, rather than silently doing something
+        expensive.
+
+        Parameters
+        ----------
+        category:
+            Biolink category, with or without the ``biolink:`` prefix.
+        limit:
+            Stop after this many CURIEs when given.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} has no category index; "
+            "callers should fall back to filter_nodes()"
+        )
+
     @abc.abstractmethod
     def close(self) -> None:
         """Release any open handles or connections."""
@@ -619,6 +649,20 @@ class SQLiteMetadataBackend(MetadataBackend):
                 if all(str(d.get(k)) == str(v) for k, v in python_filters.items())
             ]
         return results
+
+    def nodes_by_category(
+        self,
+        category: str,
+        *,
+        limit: int | None = None,
+    ) -> list[str]:
+        """Read straight off the ``idx_nc_category`` index on ``node_categories``."""
+        sql = "SELECT node_id FROM node_categories WHERE category = ?"
+        params: list[Any] = [_strip_biolink(category)]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return [r[0] for r in self._conn().execute(sql, params).fetchall()]
 
     def filter_edges(
         self,
@@ -1024,6 +1068,25 @@ class DuckDBMetadataBackend(MetadataBackend):
             ]
         return results
 
+    def nodes_by_category(
+        self,
+        category: str,
+        *,
+        limit: int | None = None,
+    ) -> list[str]:
+        """Scan the ``categories`` list column for *category*.
+
+        There is no category index here, but DuckDB is columnar so projecting a
+        single column beats shipping every node id into the query as a candidate
+        list.
+        """
+        sql = "SELECT id FROM nodes WHERE array_contains(categories, ?)"
+        params: list[Any] = [_strip_biolink(category)]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return [r[0] for r in self._q().execute(sql, params).fetchall()]
+
     def filter_edges(
         self,
         edges: list[PathEdge],
@@ -1385,6 +1448,29 @@ class LMDBMetadataBackend(MetadataBackend):
                         continue
                     results.append(self._normalise_node(data))
         return results
+
+    def nodes_by_category(
+        self,
+        category: str,
+        *,
+        limit: int | None = None,
+    ) -> list[str]:
+        """Prefix-scan the ``node_cats`` index; no candidate list needed."""
+        prefix = _strip_biolink(category).encode() + self._SEP
+        out: list[str] = []
+        with self._env.begin() as txn:
+            cursor = txn.cursor(db=self._cats_db)
+            if cursor.set_range(prefix):
+                while True:
+                    raw_key = cursor.key()
+                    if not raw_key.startswith(prefix):
+                        break
+                    out.append(raw_key[len(prefix):].decode())
+                    if limit is not None and len(out) >= limit:
+                        break
+                    if not cursor.next():
+                        break
+        return out
 
     def filter_edges(
         self,
@@ -1817,6 +1903,47 @@ class ElasticsearchMetadataBackend(MetadataBackend):
             )
         return results
 
+    def nodes_by_category(
+        self,
+        category: str,
+        *,
+        limit: int | None = None,
+    ) -> list[str]:
+        """Term query on ``category``, paged with ``search_after``.
+
+        A Biolink category routinely holds more than ``index.max_result_window``
+        nodes, so this pages on a sort key instead of asking for one oversized
+        result set.  Only the ``id`` field is fetched.
+        """
+        page = self._ES_MAX_RESULT_WINDOW
+        if limit is not None:
+            page = min(page, limit)
+
+        out: list[str] = []
+        search_after: list | None = None
+        while True:
+            kwargs: dict = {
+                "index": self._nodes_idx,
+                "query": {"term": {"category": _strip_biolink(category)}},
+                "size": page,
+                "sort": [{"_id": "asc"}],
+                "source_includes": ["id"],
+            }
+            if search_after is not None:
+                kwargs["search_after"] = search_after
+            resp = self._es.search(**kwargs)
+            hits = resp["hits"]["hits"]
+            if not hits:
+                break
+            for h in hits:
+                out.append(h["_source"].get("id") or h["_id"])
+                if limit is not None and len(out) >= limit:
+                    return out
+            if len(hits) < page:
+                break
+            search_after = hits[-1]["sort"]
+        return out
+
     def filter_edges(
         self,
         edges: list[PathEdge],
@@ -2048,6 +2175,21 @@ class HybridMetadataBackend(MetadataBackend):
         if self._mode == "es":
             return self._es.get_edge(subject, predicate, obj)  # type: ignore[union-attr]
         return self._lmdb.get_edge(subject, predicate, obj)  # type: ignore[union-attr]
+
+    def nodes_by_category(
+        self,
+        category: str,
+        *,
+        limit: int | None = None,
+    ) -> list[str]:
+        """Prefer LMDB's local prefix scan; fall back to ES when LMDB is absent.
+
+        Unlike ``filter_nodes`` there is no input size to route on, and a local
+        index scan beats a network round-trip, so LMDB wins whenever available.
+        """
+        if self._lmdb is not None:
+            return self._lmdb.nodes_by_category(category, limit=limit)
+        return self._es.nodes_by_category(category, limit=limit)  # type: ignore[union-attr]
 
     # ── bulk filtering ───────────────────────────────────────────────────────
 

@@ -205,6 +205,57 @@ def test_sqlite_backend_build_and_filter(archive: Path, tmp_path: Path):
         db.close()
 
 
+def test_sqlite_nodes_by_category(archive: Path, tmp_path: Path):
+    """nodes_by_category answers from the index, agreeing with filter_nodes."""
+    db = SQLiteMetadataBackend.build(
+        str(archive),
+        str(tmp_path / "cat.db"),
+        node_metadata_fields=["name", "category"],
+        edge_metadata_fields=["knowledge_level", "agent_type"],
+    )
+    try:
+        genes = db.nodes_by_category("biolink:Gene")
+        assert genes, "expected the synthetic archive to contain Gene nodes"
+
+        # Must match what the candidate-list API reports for the same category.
+        every_id = [n["id"] for n in db.filter_nodes(genes + ["CHEBI:1", "MONDO:1"])]
+        via_filter = {
+            n["id"] for n in db.filter_nodes(every_id, category="biolink:Gene")
+        }
+        assert set(genes) == via_filter
+
+        # The prefix accepts a bare category too, and limit is honoured.
+        assert set(db.nodes_by_category("Gene")) == set(genes)
+        assert len(db.nodes_by_category("biolink:Gene", limit=1)) == 1
+    finally:
+        db.close()
+
+
+def test_nodes_by_category_fallback_is_detectable():
+    """A backend without a category index must signal, not silently full-scan."""
+    from metadata_db import MetadataBackend
+
+    class _NoIndexDB(MetadataBackend):
+        def get_node(self, node_id):
+            return {}
+
+        def get_edge(self, subject, predicate, obj):
+            return {}
+
+        def filter_nodes(self, node_ids, *, category=None, extra_filters=None):
+            return []
+
+        def filter_edges(self, edges, *, knowledge_level=None, agent_type=None,
+                         extra_filters=None):
+            return []
+
+        def close(self):
+            pass
+
+    with pytest.raises(NotImplementedError):
+        _NoIndexDB().nodes_by_category("biolink:Gene")
+
+
 def test_sqlite_backend_match_path(archive: Path, tmp_path: Path):
     g = CSRGraph.from_kgx_archive(str(archive), node_metadata_fields=["name", "category"])
     db = SQLiteMetadataBackend.build(

@@ -2255,11 +2255,22 @@ def _resolve_node_candidates(
             return [graph.nodes[i] for i in graph._expand_subclasses(graph.node_to_id[nid])]
         return [nid]
     if "category" in node_spec:
-        matched = db.filter_nodes(
-            list(graph.node_to_id.keys()),
-            category=node_spec["category"],
-        )
-        return [m["id"] for m in matched if m["id"] in graph.node_to_id]
+        # Ask the backend which nodes carry the category, rather than handing it
+        # every node in the graph and asking which ones survive.  The latter
+        # builds a list of millions of CURIEs per call; backends with a category
+        # index answer this directly.
+        try:
+            candidates = db.nodes_by_category(node_spec["category"])
+        except NotImplementedError:
+            candidates = [
+                m["id"]
+                for m in db.filter_nodes(
+                    list(graph.node_to_id.keys()),
+                    category=node_spec["category"],
+                )
+            ]
+        node_to_id = graph.node_to_id
+        return [c for c in candidates if c in node_to_id]
     return []
 
 
