@@ -11,6 +11,10 @@ Both run against the *same* graph object, so the only difference is the
 traversal code.  The new path runs first, so the old path gets the warmer LMDB
 page cache — biasing the comparison against the change being measured.
 
+Because the old ``match_path`` runs against a *current* graph instance, it can
+only reach private helpers that still exist by that name.  If a ref renamed one,
+compare against a ref from before that rename instead.
+
 Usage::
 
     .venv/bin/python bench_match_path.py [--hops 2,3] [--limit 100000] [--old-ref REF]

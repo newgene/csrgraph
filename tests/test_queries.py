@@ -620,6 +620,97 @@ class TestMatchPathTruncation:
         assert "truncated" not in caplog.text
 
 
+class TestMatchPathReachabilityPruning:
+    """Backward-reachability pruning must never discard a valid path.
+
+    Pruning engages only for patterns with a pinned tail and >= 3 hops, so every
+    pattern here is 3 hops.
+    """
+
+    # Live chain plus a same-component dead-end branch off the start.
+    _A, _B, _C, _D = "N:A", "N:B", "N:C", "N:D"
+    _X, _Y, _Z = "N:X", "N:Y", "N:Z"
+    # A second, disconnected component.
+    _E, _F, _G, _H = "N:E", "N:F", "N:G", "N:H"
+
+    @pytest.fixture(scope="class")
+    def graph(self):
+        from csrgraph_kgx import CSRGraph  # noqa: PLC0415
+
+        triples = [
+            # A -> B -> C -> D  (the only 3-hop route to D)
+            (self._A, "biolink:related_to", self._B),
+            (self._B, "biolink:related_to", self._C),
+            (self._C, "biolink:related_to", self._D),
+            # A -> X -> Y -> Z  (same component, never reaches D)
+            (self._A, "biolink:related_to", self._X),
+            (self._X, "biolink:related_to", self._Y),
+            (self._Y, "biolink:related_to", self._Z),
+            # E -> F -> G -> H  (separate component entirely)
+            (self._E, "biolink:related_to", self._F),
+            (self._F, "biolink:related_to", self._G),
+            (self._G, "biolink:related_to", self._H),
+        ]
+        return CSRGraph(triples)
+
+    @pytest.fixture(scope="class")
+    def stub_db(self):
+        from metadata_db import MetadataBackend  # noqa: PLC0415
+
+        class _StubDB(MetadataBackend):
+            def get_node(self, node_id):
+                return {"id": node_id}
+
+            def get_edge(self, subject, predicate, obj):
+                return {"subject": subject, "predicate": predicate, "object": obj}
+
+            def filter_nodes(self, node_ids, *, category=None, extra_filters=None):
+                return [{"id": nid} for nid in node_ids]
+
+            def filter_edges(self, edges, *, knowledge_level=None, agent_type=None,
+                             extra_filters=None):
+                return [
+                    {"subject": s, "predicate": p, "object": o} for s, p, o in edges
+                ]
+
+            def close(self):
+                pass
+
+        return _StubDB()
+
+    def _spec(self, end):
+        return [self._A, None, None, None, None, None, end]
+
+    def test_finds_the_reachable_path(self, graph, stub_db):
+        """Pruning must not remove the one genuine 3-hop path."""
+        paths = graph.match_path(self._spec(self._D), limit=100, db=stub_db)
+        assert len(paths) == 1
+        assert [e[2] for e in paths[0]] == [self._B, self._C, self._D]
+
+    def test_finds_path_down_the_other_branch(self, graph, stub_db):
+        """The X branch is a dead end for D but the real route to Z."""
+        paths = graph.match_path(self._spec(self._Z), limit=100, db=stub_db)
+        assert len(paths) == 1
+        assert [e[2] for e in paths[0]] == [self._X, self._Y, self._Z]
+
+    def test_end_closer_than_the_pattern_length(self, graph, stub_db):
+        """Y sits 2 hops from A, and the graph is acyclic, so no 3-hop walk lands on it."""
+        assert graph.match_path(self._spec(self._Y), limit=100, db=stub_db) == []
+
+    def test_unreachable_end_other_component(self, graph, stub_db):
+        """H is in a different weakly-connected component: short-circuit to empty."""
+        assert graph.match_path(self._spec(self._H), limit=100, db=stub_db) == []
+
+    def test_pruning_matches_unpruned_result(self, graph, stub_db):
+        """A wildcard tail (no pruning) and a pinned tail must agree on D's paths."""
+        wildcard = graph.match_path(
+            [self._A, None, None, None, None, None, None], limit=1000, db=stub_db
+        )
+        via_wildcard = [p for p in wildcard if p[-1][2] == self._D]
+        pinned = graph.match_path(self._spec(self._D), limit=1000, db=stub_db)
+        assert pinned == via_wildcard
+
+
 class TestMetadataLookups:
     """Direct metadata retrieval tests."""
 

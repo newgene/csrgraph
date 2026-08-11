@@ -1518,27 +1518,29 @@ class CSRGraph:
     #: Sentinel distance meaning "farther than the bounded BFS looked".
     _DIST_FAR = 255
 
-    def _distance_within(
+    def _reach_masks(
         self,
         target_ids: frozenset[int],
         max_depth: int,
-    ) -> np.ndarray:
-        """Hop distance from each node to the nearest target, up to *max_depth*.
+    ) -> List[np.ndarray]:
+        """Masks of the nodes within ``r`` hops of a target, for ``r`` in 0..*max_depth*.
 
-        A bounded multi-source BFS over the reversed merged adjacency; nodes
-        farther than *max_depth* (or unreachable) get :attr:`_DIST_FAR`.  Only
-        the ``max_depth``-hop backward neighbourhood is touched, so the cost
-        scales with the useful neighbourhood rather than the whole graph.
+        Element ``r`` is a boolean array over node indices, true where a node can
+        reach one of *target_ids* in at most ``r`` hops.  Backed by a bounded
+        multi-source BFS over the reversed merged adjacency, so only the
+        ``max_depth``-hop backward neighbourhood is touched rather than the whole
+        graph.  All masks are built and cached together, keeping the per-hop cost
+        of a query to a dict lookup.
 
         Topology only: predicate and metadata constraints are ignored, which
-        makes this an **admissible** bound.  Constraints can only remove paths,
-        so a node this reports as too far to reach a target within the
-        remaining hops cannot lie on a matching path — pruning on it never
-        discards a valid result.
+        makes these an **admissible** bound.  Constraints can only remove paths,
+        so a node these report as too far to reach a target within the remaining
+        hops cannot lie on a matching path — pruning on it never discards a
+        valid result.
         """
-        cache = getattr(self, "_dist_cache", None)
+        cache = getattr(self, "_reach_cache", None)
         if cache is None:
-            cache = self._dist_cache = {}
+            cache = self._reach_cache = {}
         key = (target_ids, max_depth)
         hit = cache.get(key)
         if hit is not None:
@@ -1568,12 +1570,14 @@ class CSRGraph:
             frontier = np.unique(nbrs)
             dist[frontier] = d
 
+        masks = [dist <= r for r in range(max_depth + 1)]
+
         # Bounded by the number of distinct (target set, depth) pairs a process
         # sees; keep it small so long-lived servers do not accumulate arrays.
         if len(cache) > 32:
             cache.clear()
-        cache[key] = dist
-        return dist
+        cache[key] = masks
+        return masks
 
     def all_paths(
         self,
@@ -2027,7 +2031,7 @@ class CSRGraph:
         end_ids = _pinned_node_ids(
             node_specs[-1], self, node_subclassing=node_subclassing
         )
-        dist_to_end: Optional[np.ndarray] = None
+        reach_masks: Optional[List[np.ndarray]] = None
         if end_ids and n_hops >= 3:
             start_ids = [
                 self.node_to_id[n] for n in start_nodes if n in self.node_to_id
@@ -2040,7 +2044,7 @@ class CSRGraph:
                 # No start shares a weakly-connected component with any end, so
                 # no directed path can exist. O(1) after the cached labelling.
                 return _done([])
-            dist_to_end = self._distance_within(end_ids, n_hops - 1)
+            reach_masks = self._reach_masks(end_ids, n_hops - 1)
 
         for hop, (edge_spec, next_node_spec) in enumerate(
             zip(edge_specs, node_specs[1:])
@@ -2049,7 +2053,19 @@ class CSRGraph:
             hop_cap = limit if is_last_hop else intermediate_cap
             next_frontier: List[tuple[str, List[PathEdge]]] = []
 
+            # Nodes that can still reach the pinned tail after this hop.  Passed
+            # into expansion so unreachable neighbours are masked off the CSR row
+            # rather than built into candidate tuples and discarded later.
+            #
+            # This matters most on the *final* hop, where ``remaining_hops`` is 0
+            # and the mask collapses to ``distance == 0`` — the pinned tail set
+            # itself.  That is the widest frontier, so masking there turns a
+            # full expansion of every neighbour into just the ones that land on
+            # the target.
             remaining_hops = n_hops - hop - 1
+            reach_ok: Optional[np.ndarray] = (
+                reach_masks[remaining_hops] if reach_masks is not None else None
+            )
 
             def _flush(pending: List[tuple]) -> List[tuple]:
                 """Metadata-filter one batch of candidate expansions.
@@ -2059,18 +2075,6 @@ class CSRGraph:
                 """
                 if not pending:
                     return []
-
-                # Drop branches that cannot reach the pinned tail in the hops
-                # that remain.  Done first, so dead candidates never reach the
-                # metadata backend — the expensive part.
-                if dist_to_end is not None and remaining_hops > 0:
-                    node_to_id = self.node_to_id
-                    pending = [
-                        c for c in pending
-                        if dist_to_end[node_to_id[c[2]]] <= remaining_hops
-                    ]
-                    if not pending:
-                        return []
 
                 if isinstance(edge_spec, dict):
                     survivors = _mp_filter_edges_batch(
@@ -2109,7 +2113,9 @@ class CSRGraph:
 
             for current_node, path_so_far in frontier:
                 consumed += 1
-                for nbr, pred in _mp_expand_edges(self, current_node, edge_spec):
+                for nbr, pred in _mp_expand_edges(
+                    self, current_node, edge_spec, reach_ok
+                ):
                     batch.append((current_node, path_so_far, nbr, pred))
 
                 # The flush threshold adapts to how many results this hop still
@@ -2288,12 +2294,19 @@ def _mp_expand_edges(
     graph: CSRGraph,
     node_id: str,
     edge_spec: EdgeSpec,
+    reach_ok: Optional[np.ndarray] = None,
 ) -> List[tuple]:
     """Return ``(neighbor_id, predicate)`` pairs reachable from *node_id*.
 
     For exact-predicate EdgeSpecs uses only that relation's CSR matrix.
     For ``None``/dict specs iterates all per-predicate CSRs to preserve the
     exact predicate label in the output.
+
+    *reach_ok*, when given, is a boolean array over node indices marking which
+    neighbours can still reach the query's pinned tail within the hops that
+    remain.  It is applied as a numpy mask on the raw CSR row, so unreachable
+    neighbours are discarded before any Python tuple is built — the difference
+    between filtering candidates and never creating them.
     """
     if node_id not in graph.node_to_id:
         return []
@@ -2310,7 +2323,10 @@ def _mp_expand_edges(
         start, end = int(csr.indptr[u]), int(csr.indptr[u + 1])
         if start == end:
             return []
-        return [(nodes[v], pred_label) for v in csr.indices[start:end].tolist()]
+        row = csr.indices[start:end]
+        if reach_ok is not None:
+            row = row[reach_ok[row]]
+        return [(nodes[v], pred_label) for v in row.tolist()]
 
     # None or dict: visit every relation, since each edge must keep its own
     # predicate.  Most relations hold no row for a given node (mean degree ~17
@@ -2322,7 +2338,12 @@ def _mp_expand_edges(
         end = indptr[u + 1]
         if start == end:
             continue
-        pairs.extend((nodes[v], pred_label) for v in indices[start:end].tolist())
+        row = indices[start:end]
+        if reach_ok is not None:
+            row = row[reach_ok[row]]
+            if row.size == 0:
+                continue
+        pairs.extend((nodes[v], pred_label) for v in row.tolist())
     return pairs
 
 
