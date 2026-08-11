@@ -35,9 +35,9 @@ import os
 import sys
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, Literal, Optional, Sequence, Tuple, overload
 
-from csrgraph_kgx import CSRGraph
+from csrgraph_kgx import CSRGraph, MatchStats
 from metadata_db import ElasticsearchMetadataBackend
 
 # --------------------------------------------------------------------------- #
@@ -207,6 +207,22 @@ def connect(
     return [p] if p else []
 
 
+@overload
+def associations(
+    graph: CSRGraph, source: str, target_category: str, *,
+    max_hops: int = ..., limit: int = ..., node_subclassing: bool = ...,
+    return_stats: Literal[False] = ...,
+) -> List[List[PathEdge]]: ...
+
+
+@overload
+def associations(
+    graph: CSRGraph, source: str, target_category: str, *,
+    max_hops: int = ..., limit: int = ..., node_subclassing: bool = ...,
+    return_stats: Literal[True],
+) -> Tuple[List[List[PathEdge]], MatchStats]: ...
+
+
 def associations(
     graph: CSRGraph,
     source: str,
@@ -215,13 +231,18 @@ def associations(
     max_hops: int = 1,
     limit: int = 1000,
     node_subclassing: bool = True,
-) -> List[List[PathEdge]]:
+    return_stats: bool = False,
+):
     """All paths of length ``max_hops`` from *source* to any node of a category.
 
     Builds an alternating ``match_path`` spec ``[source, *, *, ..., {category}]``
     with wildcard intermediates.  ``node_subclassing=True`` (default) expands any
     fixed CURIE node spec to its subtypes; the category endpoint already matches
     every subtype of that category.
+
+    Pass ``return_stats=True`` to get ``(paths, MatchStats)`` and check
+    ``stats.truncated`` — a hop cap can make the result a subset of the matches
+    rather than the complete set.  Truncation is logged as a warning regardless.
     """
     if max_hops < 1:
         raise ValueError("max_hops must be >= 1")
@@ -229,7 +250,10 @@ def associations(
     for _ in range(max_hops - 1):
         spec += [None, None]  # wildcard edge, wildcard intermediate node
     spec += [None, {"category": target_category}]  # final wildcard edge + typed endpoint
-    return graph.match_path(spec, limit=limit, node_subclassing=node_subclassing)
+    return graph.match_path(
+        spec, limit=limit, node_subclassing=node_subclassing,
+        return_stats=return_stats,
+    )
 
 
 # --------------------------------------------------------------------------- #

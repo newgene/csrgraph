@@ -15,6 +15,7 @@ Requires Python 3.14+ (uses ``compression.zstd``) **or** the third-party
 from __future__ import annotations
 
 import json
+import logging
 import os
 import pickle
 import struct
@@ -22,8 +23,9 @@ import sys
 import tarfile
 import time
 from collections import Counter, defaultdict, deque
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple, overload
 
 import numpy as np
 from metadata_db import (
@@ -32,6 +34,8 @@ from metadata_db import (
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.csgraph import shortest_path as csgraph_shortest_path
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +97,36 @@ PathEdge = Tuple[str, Optional[str], str]
 #   EdgeSpec: str = exact predicate | dict = metadata filter | None = wildcard
 NodeSpec = str | dict | None
 EdgeSpec = str | dict | None
+
+
+@dataclass
+class MatchStats:
+    """Completeness report for one :meth:`CSRGraph.match_path` call.
+
+    ``match_path`` bounds each hop, so a result set may be a *subset* of the
+    matching paths.  For "find all matching paths" use cases that distinction
+    matters: a truncated result is not a negative result.  Request this via
+    ``return_stats=True`` to find out, or watch for the logged warning.
+
+    Attributes
+    ----------
+    truncated:
+        True when at least one hop hit its cap, meaning matching paths were
+        discarded and the returned set is incomplete.
+    truncated_hops:
+        Zero-based indices of the hops that hit their cap.
+    frontier_sizes:
+        Surviving frontier size after each hop, useful for spotting which hop
+        exploded.
+    hop_caps:
+        The cap applied at each hop (``limit`` on the final hop, the larger
+        intermediate bound before it).
+    """
+
+    truncated: bool = False
+    truncated_hops: List[int] = field(default_factory=list)
+    frontier_sizes: List[int] = field(default_factory=list)
+    hop_caps: List[int] = field(default_factory=list)
 
 
 def _strip_biolink(value: str) -> str:
@@ -1765,13 +1799,35 @@ class CSRGraph:
 
         return results
 
+    @overload
+    def match_path(
+        self,
+        path_spec: list,
+        limit: int = ...,
+        node_subclassing: bool = ...,
+        db: MetadataBackend | None = ...,
+        return_stats: Literal[False] = ...,
+    ) -> List[List[PathEdge]]: ...
+
+    @overload
+    def match_path(
+        self,
+        path_spec: list,
+        limit: int = ...,
+        node_subclassing: bool = ...,
+        db: MetadataBackend | None = ...,
+        *,
+        return_stats: Literal[True],
+    ) -> Tuple[List[List[PathEdge]], MatchStats]: ...
+
     def match_path(
         self,
         path_spec: list,
         limit: int = 100,
         node_subclassing: bool = False,
         db: MetadataBackend | None = None,
-    ) -> List[List[PathEdge]]:
+        return_stats: bool = False,
+    ) -> List[List[PathEdge]] | Tuple[List[List[PathEdge]], MatchStats]:
         """Find all paths matching a fixed-length node/edge pattern.
 
         Combines in-memory CSR topology traversal (this graph) with metadata
@@ -1781,6 +1837,10 @@ class CSRGraph:
         ----------
         db : MetadataBackend, optional
             Metadata backend to use.  Falls back to ``self.db`` when omitted.
+        return_stats : bool
+            When ``True`` return ``(paths, MatchStats)`` instead of just the
+            paths, so callers can tell a complete result from a capped one.
+            Truncation is logged as a warning either way.
         path_spec : list
             Alternating ``[NodeSpec, EdgeSpec, NodeSpec, EdgeSpec, ..., NodeSpec]``.
             Length must be odd and >= 3 (at least one hop).
@@ -1814,6 +1874,8 @@ class CSRGraph:
         list[list[PathEdge]]
             Each element is one complete matching path: a list of
             ``(subject, predicate, object)`` tuples, one per hop.
+            With ``return_stats=True``, a ``(paths, MatchStats)`` tuple; check
+            ``stats.truncated`` before reading the result as exhaustive.
 
         Examples
         --------
@@ -1854,11 +1916,24 @@ class CSRGraph:
         node_specs: List[NodeSpec] = path_spec[0::2]
         edge_specs: List[EdgeSpec] = path_spec[1::2]
 
+        stats = MatchStats()
+
+        def _done(paths: List[List[PathEdge]]):
+            if stats.truncated:
+                logger.warning(
+                    "match_path truncated at hop(s) %s (caps %s, frontier sizes %s): "
+                    "returning %d path(s), which is a subset of the matches. "
+                    "Raise limit= for a complete result.",
+                    stats.truncated_hops, stats.hop_caps, stats.frontier_sizes,
+                    len(paths),
+                )
+            return (paths, stats) if return_stats else paths
+
         start_nodes = _resolve_node_candidates(
             node_specs[0], self, db, node_subclassing=node_subclassing
         )
         if not start_nodes:
-            return []
+            return _done([])
 
         # frontier: list of (current_node_id, path_edges_so_far)
         frontier: List[tuple[str, List[PathEdge]]] = [(nid, []) for nid in start_nodes]
@@ -1920,8 +1995,10 @@ class CSRGraph:
             # plus a full category-index scan), and calling per node multiplies
             # that cost by the frontier size, which at hop 3+ is the cap.
             batch: List[tuple] = []
+            consumed = 0
 
             for current_node, path_so_far in frontier:
+                consumed += 1
                 for nbr, pred in _mp_expand_edges(self, current_node, edge_spec):
                     batch.append((current_node, path_so_far, nbr, pred))
 
@@ -1940,12 +2017,26 @@ class CSRGraph:
 
             if batch and len(next_frontier) < hop_cap:
                 next_frontier.extend(_flush(batch))
+                batch = []
 
+            # This hop is incomplete if the cap stopped us before the frontier
+            # was fully consumed, if a filtered batch was left unmerged, or if
+            # survivors had to be sliced away below.
+            if (
+                consumed < len(frontier)
+                or bool(batch)
+                or len(next_frontier) > hop_cap
+            ):
+                stats.truncated = True
+                stats.truncated_hops.append(hop)
+
+            stats.hop_caps.append(hop_cap)
             frontier = next_frontier[:hop_cap]
+            stats.frontier_sizes.append(len(frontier))
             if not frontier:
-                return []
+                return _done([])
 
-        return [path for _, path in frontier[:limit]]
+        return _done([path for _, path in frontier[:limit]])
 
     # ------------------------------------------------------------------
     # Internal helpers

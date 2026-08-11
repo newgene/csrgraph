@@ -545,6 +545,81 @@ class TestMatchPath:
             assert pred == "biolink:affects"
 
 
+class TestMatchPathTruncation:
+    """match_path must report when a hop cap makes the result a subset."""
+
+    _SRC = "CHEBI:SRC"
+    _TARGETS = [f"NCBIGene:T{i}" for i in range(6)]
+
+    @pytest.fixture(scope="class")
+    def graph(self):
+        from csrgraph_kgx import CSRGraph  # noqa: PLC0415
+
+        triples = [(self._SRC, "biolink:affects", t) for t in self._TARGETS]
+        return CSRGraph(triples)
+
+    @pytest.fixture(scope="class")
+    def stub_db(self):
+        from metadata_db import MetadataBackend  # noqa: PLC0415
+
+        class _StubDB(MetadataBackend):
+            def get_node(self, node_id):
+                return {"id": node_id}
+
+            def get_edge(self, subject, predicate, obj):
+                return {"subject": subject, "predicate": predicate, "object": obj}
+
+            def filter_nodes(self, node_ids, *, category=None, extra_filters=None):
+                return [{"id": nid} for nid in node_ids]
+
+            def filter_edges(self, edges, *, knowledge_level=None, agent_type=None,
+                             extra_filters=None):
+                return [
+                    {"subject": s, "predicate": p, "object": o} for s, p, o in edges
+                ]
+
+            def close(self):
+                pass
+
+        return _StubDB()
+
+    _SPEC = [_SRC, "biolink:affects", None]
+
+    def test_complete_result_not_flagged(self, graph, stub_db):
+        paths, stats = graph.match_path(
+            self._SPEC, limit=100, db=stub_db, return_stats=True
+        )
+        assert len(paths) == len(self._TARGETS)
+        assert stats.truncated is False
+        assert stats.truncated_hops == []
+        assert stats.frontier_sizes == [len(self._TARGETS)]
+
+    def test_capped_result_is_flagged(self, graph, stub_db):
+        paths, stats = graph.match_path(
+            self._SPEC, limit=2, db=stub_db, return_stats=True
+        )
+        assert len(paths) == 2
+        assert stats.truncated is True
+        assert stats.truncated_hops == [0]
+        assert stats.hop_caps == [2]
+
+    def test_truncation_is_logged_without_return_stats(self, graph, stub_db, caplog):
+        """Existing callers get the signal without opting in to the new return shape."""
+        import logging  # noqa: PLC0415
+
+        with caplog.at_level(logging.WARNING, logger="csrgraph_kgx"):
+            paths = graph.match_path(self._SPEC, limit=2, db=stub_db)
+        assert isinstance(paths, list) and len(paths) == 2
+        assert "truncated" in caplog.text
+
+    def test_no_warning_when_complete(self, graph, stub_db, caplog):
+        import logging  # noqa: PLC0415
+
+        with caplog.at_level(logging.WARNING, logger="csrgraph_kgx"):
+            graph.match_path(self._SPEC, limit=100, db=stub_db)
+        assert "truncated" not in caplog.text
+
+
 class TestMetadataLookups:
     """Direct metadata retrieval tests."""
 
