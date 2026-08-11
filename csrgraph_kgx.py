@@ -1504,6 +1504,77 @@ class CSRGraph:
         labels = self._relation_component_cache[relation]
         return bool(labels[src_id] == labels[tgt_id])
 
+    def _reverse_merged(self) -> csr_matrix:
+        """Lazily cache the transpose of the merged adjacency (topology only).
+
+        Used for backward reachability probes.  Costs roughly the same as
+        ``csr_merged`` itself, so it is built only when a query actually needs
+        backward traversal.
+        """
+        if not hasattr(self, "_reverse_merged_cache"):
+            self._reverse_merged_cache: csr_matrix = self.csr_merged.T.tocsr()
+        return self._reverse_merged_cache
+
+    #: Sentinel distance meaning "farther than the bounded BFS looked".
+    _DIST_FAR = 255
+
+    def _distance_within(
+        self,
+        target_ids: frozenset[int],
+        max_depth: int,
+    ) -> np.ndarray:
+        """Hop distance from each node to the nearest target, up to *max_depth*.
+
+        A bounded multi-source BFS over the reversed merged adjacency; nodes
+        farther than *max_depth* (or unreachable) get :attr:`_DIST_FAR`.  Only
+        the ``max_depth``-hop backward neighbourhood is touched, so the cost
+        scales with the useful neighbourhood rather than the whole graph.
+
+        Topology only: predicate and metadata constraints are ignored, which
+        makes this an **admissible** bound.  Constraints can only remove paths,
+        so a node this reports as too far to reach a target within the
+        remaining hops cannot lie on a matching path — pruning on it never
+        discards a valid result.
+        """
+        cache = getattr(self, "_dist_cache", None)
+        if cache is None:
+            cache = self._dist_cache = {}
+        key = (target_ids, max_depth)
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+
+        rev = self._reverse_merged()
+        indptr, indices = rev.indptr, rev.indices
+        dist = np.full(self.num_nodes, self._DIST_FAR, dtype=np.uint8)
+        frontier = np.fromiter(target_ids, dtype=np.int64, count=len(target_ids))
+        dist[frontier] = 0
+
+        for d in range(1, min(max_depth, self._DIST_FAR - 1) + 1):
+            if frontier.size == 0:
+                break
+            # Ragged gather of every reverse-neighbour row of the frontier.
+            starts = indptr[frontier]
+            counts = indptr[frontier + 1] - starts
+            total = int(counts.sum())
+            if total == 0:
+                break
+            offsets = np.repeat(starts, counts)
+            within = np.arange(total) - np.repeat(np.cumsum(counts) - counts, counts)
+            nbrs = indices[offsets + within]
+            nbrs = nbrs[dist[nbrs] == self._DIST_FAR]
+            if nbrs.size == 0:
+                break
+            frontier = np.unique(nbrs)
+            dist[frontier] = d
+
+        # Bounded by the number of distinct (target set, depth) pairs a process
+        # sees; keep it small so long-lived servers do not accumulate arrays.
+        if len(cache) > 32:
+            cache.clear()
+        cache[key] = dist
+        return dist
+
     def all_paths(
         self,
         source: str,
@@ -1946,12 +2017,39 @@ class CSRGraph:
         n_hops = len(edge_specs)
         intermediate_cap = max(limit * 50, 50_000)
 
+        # ---- backward reachability pruning (both ends pinned) --------------
+        # When the tail is a fixed node we know where the walk has to land, so
+        # branches that cannot reach it in the hops that remain are dead and
+        # should die *before* they cost a metadata round-trip.
+        # Gated at 3 hops: shorter walks are already cheap enough that building
+        # the reverse adjacency costs more than the pruning saves (measured
+        # 0.26s of setup against a 0.00s 2-hop query).
+        end_ids = _pinned_node_ids(
+            node_specs[-1], self, node_subclassing=node_subclassing
+        )
+        dist_to_end: Optional[np.ndarray] = None
+        if end_ids and n_hops >= 3:
+            start_ids = [
+                self.node_to_id[n] for n in start_nodes if n in self.node_to_id
+            ]
+            labels = self._component_labels
+            if start_ids and not (
+                {int(labels[i]) for i in start_ids}
+                & {int(labels[i]) for i in end_ids}
+            ):
+                # No start shares a weakly-connected component with any end, so
+                # no directed path can exist. O(1) after the cached labelling.
+                return _done([])
+            dist_to_end = self._distance_within(end_ids, n_hops - 1)
+
         for hop, (edge_spec, next_node_spec) in enumerate(
             zip(edge_specs, node_specs[1:])
         ):
             is_last_hop = hop == n_hops - 1
             hop_cap = limit if is_last_hop else intermediate_cap
             next_frontier: List[tuple[str, List[PathEdge]]] = []
+
+            remaining_hops = n_hops - hop - 1
 
             def _flush(pending: List[tuple]) -> List[tuple]:
                 """Metadata-filter one batch of candidate expansions.
@@ -1961,6 +2059,18 @@ class CSRGraph:
                 """
                 if not pending:
                     return []
+
+                # Drop branches that cannot reach the pinned tail in the hops
+                # that remain.  Done first, so dead candidates never reach the
+                # metadata backend — the expensive part.
+                if dist_to_end is not None and remaining_hops > 0:
+                    node_to_id = self.node_to_id
+                    pending = [
+                        c for c in pending
+                        if dist_to_end[node_to_id[c[2]]] <= remaining_hops
+                    ]
+                    if not pending:
+                        return []
 
                 if isinstance(edge_spec, dict):
                     survivors = _mp_filter_edges_batch(
@@ -2145,6 +2255,33 @@ def _resolve_node_candidates(
         )
         return [m["id"] for m in matched if m["id"] in graph.node_to_id]
     return []
+
+
+def _pinned_node_ids(
+    node_spec: NodeSpec,
+    graph: CSRGraph,
+    node_subclassing: bool = False,
+) -> frozenset[int]:
+    """Node indices a *pinned* NodeSpec resolves to, or empty if it is not pinned.
+
+    "Pinned" means the spec names specific nodes — a CURIE string or a dict with
+    an ``id`` — as opposed to a category filter or a wildcard.  Mirrors how
+    ``_mp_filter_nodes_batch`` resolves the same spec, including subclass
+    widening, so a prune based on this set cannot disagree with the filter that
+    ultimately accepts or rejects the node.
+    """
+    curie: Optional[str] = None
+    if isinstance(node_spec, str):
+        curie = node_spec
+    elif isinstance(node_spec, dict) and "id" in node_spec:
+        curie = node_spec["id"]
+    if curie is None or curie not in graph.node_to_id:
+        return frozenset()
+
+    nid = graph.node_to_id[curie]
+    if node_subclassing:
+        return frozenset(graph._expand_subclasses(nid))
+    return frozenset({nid})
 
 
 def _mp_expand_edges(

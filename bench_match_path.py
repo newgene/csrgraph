@@ -101,13 +101,25 @@ class CountingBackend(MetadataBackend):
         return getattr(self._inner, name)
 
 
-def build_spec(hops: int) -> list:
-    """The spec kg_query.associations() builds: pinned start, wildcards, typed tail."""
+def build_spec(hops: int, end: str | None = None) -> list:
+    """Alternating spec: pinned start, wildcard middles, and a tail.
+
+    The tail is a category filter (what ``kg_query.associations`` builds) unless
+    *end* pins a specific node (what ``kg_query.connect`` needs).
+    """
     spec: list = [START]
     for _ in range(hops - 1):
         spec += [None, None]
-    spec += [None, {"category": TARGET_CATEGORY}]
+    spec += [None, end if end is not None else {"category": TARGET_CATEGORY}]
     return spec
+
+
+def discover_end(g, db, hops: int) -> str | None:
+    """Find a real node reachable from START in exactly *hops* hops, to pin as a tail."""
+    paths = g.match_path(
+        build_spec(hops), limit=200, node_subclassing=True, db=db
+    )
+    return paths[-1][-1][2] if paths else None
 
 
 def run(label, fn, counter, spec, limit):
@@ -132,6 +144,10 @@ def main():
         "--old-ref", default="HEAD",
         help="git ref to take the pre-batching csrgraph_kgx.py from",
     )
+    ap.add_argument(
+        "--pin-end", action="store_true",
+        help="pin the tail to a reachable node (connect-style) instead of a category",
+    )
     args = ap.parse_args()
 
     old = load_old_module(args.old_ref)
@@ -146,7 +162,13 @@ def main():
     g.match_path([START, None, None], limit=10, db=db)
 
     for hops in [int(h) for h in args.hops.split(",")]:
-        spec = build_spec(hops)
+        end = None
+        if args.pin_end:
+            end = discover_end(g, db, hops)
+            if end is None:
+                print(f"{hops}-hop: no reachable endpoint found, skipping\n")
+                continue
+        spec = build_spec(hops, end)
         print(f"{hops}-hop  spec={spec}")
 
         # NEW first, so OLD runs against the warmer cache.
