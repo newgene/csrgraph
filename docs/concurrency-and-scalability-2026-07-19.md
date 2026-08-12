@@ -216,6 +216,24 @@ Measured throughput on the same 2-hop category query, LMDB backend:
 | Threads, `PYTHON_GIL=0` | 2.3 | 2.9 | 3.8 | 2.5 |
 | **Processes** | 2.03 | 4.14 | 8.24 | **15.37** |
 
+> **Superseded — these were measured against an O(|category|) `filter_nodes`.**
+> Replacing that scan with per-candidate point probes into the `node_cats` index
+> raised single-worker throughput **16×**, which shifts every figure above:
+>
+> | Configuration (after the fix) | 1 | 2 | 4 | 8 |
+> | --- | --- | --- | --- | --- |
+> | Threads, GIL on | 34.3 | 23.2 | 12.6 | 7.3 |
+> | **Processes** | 35.1 | — | 136.1 | **267.9** |
+>
+> The conclusions hold and sharpen: threads still anti-scale under the GIL
+> (×0.21, improved from ×0.03 because there are far fewer C-call handoffs per
+> request), processes still scale near-linearly (×7.6), and **one process now
+> beats the old eight-process configuration by 17×**. The ES comparison figures
+> elsewhere in this document were taken with the client's default
+> `connections_per_node=10`, so concurrency above ~10 threads was partly queuing
+> on the connection pool rather than on Elasticsearch — treat the ES ceiling of
+> ~50 req/s as a lower bound.
+
 ### 5.2 Move `id_maps` out of the Python heap — the biggest single win
 
 388 MB of the 500 MB private per-worker cost is `node_to_id` (dict) plus `nodes`

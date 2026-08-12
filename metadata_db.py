@@ -1233,6 +1233,13 @@ class LMDBMetadataBackend(MetadataBackend):
 
     _SEP = b"\x00"
 
+    #: ``filter_nodes(category=…)`` probes ``node_cats`` per candidate up to this
+    #: many ids, and prefix-scans the category above it.  Biolink categories on a
+    #: Translator KG run from tens of thousands to ~1M members, so a threshold in
+    #: that range keeps whichever strategy is cheaper: normal traversal batches
+    #: (≤ 10k, see ``_MP_FILTER_BATCH``) always probe.
+    _CAT_PROBE_MAX = 50_000
+
     def __init__(self, db_path: str, *, map_size: int = 50 * 1024 ** 3) -> None:
         try:
             import lmdb
@@ -1410,21 +1417,38 @@ class LMDBMetadataBackend(MetadataBackend):
         results: list[dict] = []
         with self._env.begin() as txn:
             if cat_key is not None:
-                # Use _cats_db prefix scan: keys are {category}\x00{node_id}
-                id_set = set(node_ids)
                 prefix = cat_key.encode() + self._SEP
+                # ``node_cats`` is keyed ``{category}\x00{node_id}``, so asking
+                # "is this node in this category?" is an exact B-tree lookup.
+                # Prefix-scanning the category instead costs O(|category|) no
+                # matter how few ids were asked about — 51,704 cursor steps to
+                # check 500 candidates on translator_kg — and those per-step C
+                # calls are also what made threaded serving convoy on the GIL.
+                # Probing is O(|ids| · log N).
+                #
+                # The scan still wins when the caller passes far more ids than the
+                # category holds, so it is kept for very large inputs.
+                candidates = list(dict.fromkeys(node_ids))  # dedup, keep order
                 matched_ids: list[str] = []
-                cursor = txn.cursor(db=self._cats_db)
-                if cursor.set_range(prefix):
-                    while True:
-                        raw_key = cursor.key()
-                        if not raw_key.startswith(prefix):
-                            break
-                        nid = raw_key[len(prefix):].decode()
-                        if nid in id_set:
-                            matched_ids.append(nid)
-                        if not cursor.next():
-                            break
+                if len(candidates) <= self._CAT_PROBE_MAX:
+                    cats_db = self._cats_db
+                    matched_ids = [
+                        nid for nid in candidates
+                        if txn.get(prefix + nid.encode(), db=cats_db) is not None
+                    ]
+                else:
+                    id_set = set(candidates)
+                    cursor = txn.cursor(db=self._cats_db)
+                    if cursor.set_range(prefix):
+                        while True:
+                            raw_key = cursor.key()
+                            if not raw_key.startswith(prefix):
+                                break
+                            nid = raw_key[len(prefix):].decode()
+                            if nid in id_set:
+                                matched_ids.append(nid)
+                            if not cursor.next():
+                                break
                 # Fetch full metadata for matched nodes
                 for nid in matched_ids:
                     val = txn.get(nid.encode(), db=self._nodes_db)
