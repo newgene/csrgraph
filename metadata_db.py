@@ -1603,7 +1603,7 @@ class ElasticsearchMetadataBackend(MetadataBackend):
     _INDEX_SETTINGS: dict = {
         "index": {
             "codec":              "best_compression",   # ZSTD vs LZ4 default; ~28% smaller
-            "number_of_replicas": 0,                    # single-node: no replica shards
+            "number_of_replicas": 0,                    # single-node default; see build()
         }
     }
     _NODES_MAPPING: dict = {
@@ -1634,7 +1634,7 @@ class ElasticsearchMetadataBackend(MetadataBackend):
 
     def __init__(
         self,
-        host: str = "http://localhost:9200",
+        host: str | list[str] = "http://localhost:9200",
         index_prefix: str = "kgquery",
         *,
         connections_per_node: int = 10,
@@ -1645,8 +1645,16 @@ class ElasticsearchMetadataBackend(MetadataBackend):
 
         Parameters
         ----------
+        host:
+            One node URL, or a list of them.  Against a multi-node cluster pass
+            every node so the client round-robins instead of routing every
+            request through a single coordinating node.
         connections_per_node:
-            Size of the urllib3 connection pool per node (default: 10).
+            Size of the urllib3 connection pool per node (default: 10).  This is
+            a hard ceiling on in-flight requests per node: serving more
+            concurrent queries than this queues them in the client rather than in
+            Elasticsearch, which looks like the cluster saturating when it has
+            not.  Raise it to at least the number of concurrent callers.
         request_timeout:
             Per-request timeout in seconds (default: 120).  Raise this when
             bulk-indexing large archives whose individual HTTP requests exceed
@@ -1687,12 +1695,14 @@ class ElasticsearchMetadataBackend(MetadataBackend):
         cls,
         archive_path: str,
         *,
-        host: str = "http://localhost:9200",
+        host: str | list[str] = "http://localhost:9200",
         index_prefix: str = "kgquery",
         node_metadata_fields: list[str] | None = None,
         edge_metadata_fields: list[str] | None = None,
         request_timeout: float = 120.0,
         bulk_chunk_size: int = 500,
+        number_of_shards: int | None = None,
+        number_of_replicas: int | None = None,
     ) -> ElasticsearchMetadataBackend:
         """(Re-)index a KGX archive into Elasticsearch.
 
@@ -1707,6 +1717,16 @@ class ElasticsearchMetadataBackend(MetadataBackend):
         bulk_chunk_size:
             Number of documents per bulk HTTP request (default: 500).  Reduce
             if requests are timing out even with a high *request_timeout*.
+        number_of_shards:
+            Primary shards per index.  ``None`` leaves the Elasticsearch default
+            (1).  Elasticsearch sizing guidance is 10–50 GB per shard, so a
+            single shard is correct for a graph of this size; raise it only to
+            spread work across the data nodes of a multi-node cluster, accepting
+            some fan-out overhead per query in exchange for parallelism.
+        number_of_replicas:
+            Replica shards per primary.  ``None`` keeps the single-node default
+            of 0.  On a cluster, 1 gives redundancy and extra read capacity, at
+            the cost of doubling both stored size and indexing work.
         """
         try:
             from elasticsearch.helpers import bulk  # type: ignore[import]
@@ -1718,10 +1738,22 @@ class ElasticsearchMetadataBackend(MetadataBackend):
         db = cls(host=host, index_prefix=index_prefix, request_timeout=request_timeout)
         es = db._es
 
+        # Per-build shard/replica overrides, layered over the class defaults so
+        # the class constant stays the single-node baseline.
+        overrides: dict = {}
+        if number_of_shards is not None:
+            overrides["number_of_shards"] = number_of_shards
+        if number_of_replicas is not None:
+            overrides["number_of_replicas"] = number_of_replicas
+
         for idx, mapping in [
             (db._nodes_idx, cls._NODES_MAPPING),
             (db._edges_idx, cls._EDGES_MAPPING),
         ]:
+            settings = mapping.get("settings") or {}
+            if overrides:
+                settings = {"index": {**settings.get("index", {}), **overrides}}
+                mapping = {**mapping, "settings": settings}
             if es.indices.exists(index=idx):
                 es.indices.delete(index=idx)
             es.indices.create(
