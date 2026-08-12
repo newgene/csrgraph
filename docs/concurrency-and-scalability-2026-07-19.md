@@ -63,8 +63,54 @@ artifact; my first hypothesis that it was runtime GIL re-enablement was wrong.
 The mechanism is GIL convoying: a category `filter_nodes` walks ~51,704
 `cursor.next()` calls plus zstd-decompress and `json.loads` per hit, each a short
 C call that releases and reacquires the GIL. With N threads the handoffs dominate.
-Removing the GIL entirely (`PYTHON_GIL=0`) recovers it to ×1.68 peak, which is
-consistent with that explanation.
+See [§2.1](#21-lmdb-is-thread-safe-the-collapse-is-the-gil) — this is a GIL
+artifact, not a thread-safety problem, and it disappears when the GIL is off.
+
+### 2.1 LMDB is thread-safe; the collapse is the GIL
+
+Worth separating three things this report originally ran together:
+
+| Question | Answer |
+| --- | --- |
+| Is liblmdb thread-safe for concurrent reads? | **Yes** — MVCC, readers take no locks (liblmdb 0.9.35). |
+| Is py-lmdb thread-safe for concurrent reads? | **Yes** — py-lmdb 2.3.0 uses `MDB_NOTLS` exclusively, so read transactions migrate freely across threads and one thread may hold several. Upstream docs: most `Environment` methods "are thread-safe, and may be called concurrently", except `close()`; write transactions are thread-bound. csrgraph only ever reads. |
+| Is py-lmdb *free-threading ready*? | **No** — the C extension declares no `Py_mod_gil` / `PyUnstable_Module_SetGIL` (neither symbol appears in `cpython.cpython-314t-darwin.so`), so CPython conservatively re-enables the GIL on import. This is an **opt-in declaration gap, not a defect**. |
+
+Verified directly rather than assumed. Eight threads hashing the results of 300
+`get_node` calls plus a category `filter_nodes`, all threads compared against a
+single-threaded baseline:
+
+| | GIL on | GIL off (`PYTHON_GIL=0`) |
+| --- | --- | --- |
+| Results correct (2 / 4 / 8 threads) | ✅ identical digests | ✅ identical digests |
+| Stuck threads / errors | none | none |
+| Wall time, 8 threads, same work | 1.87 s | **0.06 s** (31× faster) |
+| `db.close()` | 0.001 s | 0.001 s |
+
+And with the GIL genuinely off, LMDB *scales* on both access patterns:
+
+| Workload, GIL off | 1 thread | 2 threads | 4 threads |
+| --- | --- | --- | --- |
+| `get_node` point lookups | 137,599 /s | 309,497 /s | **394,985 /s** |
+| `filter_nodes` cursor scan | 121 calls/s | 206 (×1.70) | **246 (×2.03)** |
+| *same scan, GIL on* | 114 calls/s | 56 (×0.49) | **26 (×0.23)** |
+
+So the "LMDB cannot be threaded" conclusion is really "**the GIL cannot be
+threaded around LMDB's call pattern**". Correctness was never in question.
+
+**Upstream status.** py-lmdb issue [#458 "Support free threaded"](https://github.com/jnwatson/py-lmdb/issues/458)
+was opened 2026-05-02 and is **still open** — requested, not yet implemented. The
+maintainer has been active on adjacent GIL work: #418 "Investigate releasing GIL
+during `mdb_env_close`" closed 2026-03-17, and releasing the GIL around reads
+(#22) and fault handling with the GIL released (#65) were done years ago. So the
+hard part — dropping the GIL around blocking calls — has existed for a decade;
+what is missing is the free-threading audit and the one-line declaration.
+
+Practical reading: `PYTHON_GIL=0` produced correct results in every test here and
+never hung, but it runs a configuration upstream has not audited. Treat it as a
+**risk-accepted override worth benchmarking**, not as known-broken — and revisit
+when #458 lands, at which point LMDB + threads becomes the fastest option
+available rather than the worst.
 
 **gandalf gets partial thread parallelism (×2.09)** despite the GIL, because
 numpy releases it during the large `concatenate`/`isin` operations its kernel is
@@ -142,16 +188,22 @@ Ordered by measured value per unit of effort.
 
 ### 5.1 Match the concurrency model to the backend — free, today
 
-- **LMDB → processes only.** `gunicorn`/`uvicorn` with N *single-threaded*
-  workers. Threads must be avoided outright: ×0.03 means a threaded server
-  degrades under exactly the load it is meant to absorb. At 0.50 GB USS a worker
-  is cheap, so process-per-core is affordable.
+- **LMDB + GIL → processes only.** `gunicorn`/`uvicorn` with N *single-threaded*
+  workers. With the GIL on, threads must be avoided outright: ×0.03 means a
+  threaded server degrades under exactly the load it is meant to absorb. At
+  0.50 GB USS a worker is cheap, so process-per-core is affordable. This is the
+  supported configuration today.
 - **ES → threads are fine and preferable.** ×8.16 on 8 cores, and one process
   serving many concurrent requests keeps the graph loaded once. A threaded or
   async server plus a scaled ES cluster is the higher-ceiling configuration.
-- **Do not run the free-threaded build with the LMDB backend and threads.** It
-  gives the worst of both: the GIL comes back at runtime *and* you lose the
-  free-threaded build's guarantees. Either use processes, or use ES.
+- **LMDB + `PYTHON_GIL=0` → the fastest option, and unsupported.** Since the
+  collapse is GIL convoying rather than unsafety ([§2.1](#21-lmdb-is-thread-safe-the-collapse-is-the-gil)),
+  forcing the GIL off makes the same 8-thread workload 31× faster and restores
+  scaling (×2.03 on cursor scans, ~395k `get_node`/s at 4 threads). Correct in
+  every test run here, but py-lmdb has not declared free-threading support
+  ([#458](https://github.com/jnwatson/py-lmdb/issues/458), open), so this is a
+  risk-accepted override: benchmark it, pin the py-lmdb version, and keep a
+  process-based fallback. Worth re-testing when #458 lands.
 
 ### 5.2 Move `id_maps` out of the Python heap — the biggest single win
 
