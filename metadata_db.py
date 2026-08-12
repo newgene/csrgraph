@@ -1705,6 +1705,17 @@ class ElasticsearchMetadataBackend(MetadataBackend):
                 settings=mapping.get("settings"),
                 mappings=mapping.get("mappings"),
             )
+            # Suspend refreshes for the bulk load.  At the default 1s interval a
+            # multi-million-document build pays continuous segment creation and
+            # merging; -1 defers that until the explicit refresh after indexing.
+            #
+            # If a build fails partway the index is left unsearchable, which is
+            # acceptable because it is also incomplete: this method deletes and
+            # recreates both indices on entry, so simply re-running the build
+            # resets the setting along with the data.
+            es.indices.put_settings(
+                index=idx, settings={"index": {"refresh_interval": "-1"}}
+            )
 
         load_nodes    = node_metadata_fields is not None
         keep_all_node = node_metadata_fields == ["all"] if load_nodes else False
@@ -1824,10 +1835,19 @@ class ElasticsearchMetadataBackend(MetadataBackend):
         _flush_edges()
         _progress(force=True)
 
+        # Restore the default refresh behaviour suspended during the bulk load and
+        # make everything just indexed visible to search.  Do this before the
+        # force-merge so the indices are queryable even if the merge is slow.
+        es_slow = es.options(request_timeout=request_timeout)
+        for idx in [db._nodes_idx, db._edges_idx]:
+            es.indices.put_settings(
+                index=idx, settings={"index": {"refresh_interval": None}}
+            )
+            es_slow.indices.refresh(index=idx)
+
         # Force-merge each index to a single segment — significantly reduces
         # on-disk size by collapsing Lucene segment files.  Can be slow on large
         # indices; uses the same request_timeout as bulk indexing.
-        es_slow = es.options(request_timeout=request_timeout)
         for idx in [db._nodes_idx, db._edges_idx]:
             print(f"Force-merging {idx} to 1 segment ...", flush=True)
             es_slow.indices.forcemerge(index=idx, max_num_segments=1)

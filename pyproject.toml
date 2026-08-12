@@ -27,13 +27,29 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-lmdb = ["lmdb"]
-es = ["elasticsearch"]
-duckdb = ["duckdb"]
-server = ["fastapi", "uvicorn"]
-psutil = ["psutil"]
-all = ["lmdb", "elasticsearch", "duckdb", "fastapi", "uvicorn", "psutil"]
-dev = ["pytest", "lmdb", "fastapi", "httpx"]
+# Version floors and major caps, so a fresh install cannot silently cross a
+# major boundary:
+#   elasticsearch — the client enforces major-version compatibility with the
+#     server, so an unpinned install picking up a new major will refuse to talk
+#     to an existing cluster. Keep this range aligned with the server you run.
+#   lmdb — threading behaviour is version-sensitive: py-lmdb has not declared
+#     free-threading support (jnwatson/py-lmdb#458), so on a free-threaded
+#     interpreter importing it re-enables the GIL. Pin so that behaviour does not
+#     change under you between installs.
+lmdb = ["lmdb>=1.4,<3"]
+es = ["elasticsearch>=8,<10"]
+duckdb = ["duckdb>=0.10"]
+server = ["fastapi>=0.100", "uvicorn>=0.20"]
+psutil = ["psutil>=5.9"]
+all = [
+    "lmdb>=1.4,<3",
+    "elasticsearch>=8,<10",
+    "duckdb>=0.10",
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+    "psutil>=5.9",
+]
+dev = ["pytest>=7", "lmdb>=1.4,<3", "fastapi>=0.100", "httpx>=0.24"]
 
 [project.urls]
 Homepage = "https://github.com/newgene/csrgraph"

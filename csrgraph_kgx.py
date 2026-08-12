@@ -544,9 +544,18 @@ class CSRGraph:
             If given, only edges whose predicate matches one of these values
             are loaded.  Values may include or omit the ``biolink:`` prefix.
         node_metadata_fields : list of str, optional
-            Node metadata fields to retain from ``nodes.jsonl``. Defaults to
-            ``["name", "category"]``. Pass ``None`` or ``["all"]`` to keep
-            all node metadata.
+            Node metadata fields to retain from ``nodes.jsonl``.
+
+            - ``None`` (**the default**) — skip ``nodes.jsonl`` entirely and keep
+              **no** node metadata: a topology-only load. This is what a serving
+              snapshot wants, since metadata lives in a
+              :class:`~metadata_db.MetadataBackend`.
+            - ``["all"]`` — retain every field present on each node.
+            - a list of names, e.g. ``["name"]`` — retain those fields.
+
+            ``id`` and ``category`` are always retained whenever a list is given,
+            so ``[]`` still stores one record per node (on a ~1.7M-node graph that
+            is ~2.2 GB resident) — pass ``None``, not ``[]``, to skip metadata.
         edge_metadata_fields : list of str, optional
             Edge metadata fields to retain from ``edges.jsonl`` beyond the
             required ``subject``, ``predicate``, and ``object``.
