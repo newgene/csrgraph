@@ -96,7 +96,9 @@ PathEdge = Tuple[str, Optional[str], str]
 #   NodeSpec: str = exact CURIE | dict = metadata filter | None = wildcard
 #   EdgeSpec: str = exact predicate | dict = metadata filter | None = wildcard
 NodeSpec = str | dict | None
-EdgeSpec = str | dict | None
+#: EdgeSpec: str = one exact predicate | collection of str = any of those
+#: predicates | dict = edge metadata filter | None = wildcard
+EdgeSpec = str | dict | list | tuple | set | frozenset | None
 
 #: Default hop bound for :meth:`CSRGraph.all_paths`.  Simple-path enumeration is
 #: exponential in depth, so an unbounded default is a footgun on a real KG: five
@@ -2542,13 +2544,22 @@ def _mp_expand_frontier(
     full_plan = (
         graph._reverse_expansion_plan() if reverse else graph._expansion_plan()
     )
+    # A str or a collection of predicates restricts the plan, so the predicate
+    # filter happens *during* traversal.  Filtering afterwards is wrong whenever a
+    # cap is involved: the cap fills up with whatever predicates come first, and a
+    # selective predicate can end up with nothing left.
+    wanted: Optional[set] = None
     if isinstance(edge_spec, str):
-        # One relation only: pick it out of the plan so forward and reverse share
-        # the same lookup path.
-        want = _add_biolink(_strip_biolink(edge_spec))
-        plan: list = [entry for entry in full_plan if entry[2] == want]
-    else:
-        plan = full_plan
+        wanted = {_add_biolink(_strip_biolink(edge_spec))}
+    elif isinstance(edge_spec, (list, tuple, set, frozenset)):
+        # An empty collection means "unconstrained", matching TRAPI's reading of
+        # an absent predicates list.
+        if edge_spec:
+            wanted = {_add_biolink(_strip_biolink(p)) for p in edge_spec}
+    plan: list = (
+        full_plan if wanted is None
+        else [entry for entry in full_plan if entry[2] in wanted]
+    )
 
     labels = tuple(p[2] for p in plan)
     src_parts: list = []

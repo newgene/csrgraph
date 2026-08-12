@@ -203,6 +203,131 @@ class TestEdgeOrientation:
         assert pairs_fwd <= pairs_rev
 
 
+class TestMultiPredicateIsDisjunction:
+    """Listing more predicates must never shrink the answer set.
+
+    Multiple predicates used to become a wildcard EdgeSpec that was post-filtered
+    *after* the result cap, so the cap filled with whichever predicates came first
+    and a selective one could be squeezed out entirely. The predicate set is now
+    pushed into traversal.
+    """
+
+    @pytest.fixture(scope="class")
+    def pred_graph(self):
+        from csrgraph_kgx import CSRGraph
+
+        # 'noise' outnumbers 'wanted', so a cap applied before filtering would
+        # drop every 'wanted' edge.
+        triples = [("N:S", "biolink:noise", f"N:n{i}") for i in range(30)]
+        triples += [("N:S", "biolink:wanted", f"N:w{i}") for i in range(3)]
+        g = CSRGraph(triples)
+        g.set_db(_StubDB())
+        return g
+
+    def _count(self, g, preds, limit):
+        from trapi import query
+
+        qg = {"nodes": {"n0": {"ids": ["N:S"]}, "n1": {}},
+              "edges": {"e0": {"subject": "n0", "object": "n1",
+                               "predicates": preds}}}
+        return len(query(g, qg, limit=limit)["results"])
+
+    def test_selective_predicate_survives_a_small_cap(self, pred_graph):
+        assert self._count(pred_graph, ["biolink:wanted"], 5) == 3
+
+    def test_adding_a_predicate_never_reduces_results(self, pred_graph):
+        only_wanted = self._count(pred_graph, ["biolink:wanted"], 5)
+        with_noise = self._count(pred_graph, ["biolink:wanted", "biolink:noise"], 5)
+        assert with_noise >= only_wanted
+
+    def test_disjunction_is_the_union(self, pred_graph):
+        big = 500
+        w = self._count(pred_graph, ["biolink:wanted"], big)
+        n = self._count(pred_graph, ["biolink:noise"], big)
+        both = self._count(pred_graph, ["biolink:wanted", "biolink:noise"], big)
+        assert (w, n, both) == (3, 30, 33)
+
+
+class TestBiolinkExpander:
+    """Predicate/qualifier widening, driven by an explicit map (no BMT needed)."""
+
+    def test_predicates_widen_to_descendants(self):
+        from trapi import BiolinkExpander, expand_query_graph
+
+        exp = BiolinkExpander(predicates={
+            "biolink:treats": frozenset({"biolink:treats", "biolink:applied_to_treat"})
+        })
+        qg = {"nodes": {}, "edges": {"e0": {"subject": "n0", "object": "n1",
+                                            "predicates": ["biolink:treats"]}}}
+        out = expand_query_graph(qg, exp)
+        assert set(out["edges"]["e0"]["predicates"]) == {
+            "biolink:treats", "biolink:applied_to_treat"
+        }
+        assert qg["edges"]["e0"]["predicates"] == ["biolink:treats"], "input untouched"
+
+    def test_unknown_predicate_is_left_alone(self):
+        from trapi import BiolinkExpander, expand_query_graph
+
+        exp = BiolinkExpander(predicates={"biolink:treats": frozenset({"x"})})
+        qg = {"nodes": {}, "edges": {"e0": {"subject": "n0", "object": "n1",
+                                            "predicates": ["biolink:affects"]}}}
+        out = expand_query_graph(qg, exp)
+        assert out["edges"]["e0"]["predicates"] == ["biolink:affects"]
+
+    def test_qualifier_sets_become_alternatives(self):
+        """One constraint with a widened value becomes several sets.
+
+        TRAPI treats multiple qualifier_constraints as alternatives, so the
+        cross-product preserves the meaning without touching the match logic.
+        """
+        from trapi import BiolinkExpander, expand_query_graph
+
+        exp = BiolinkExpander(qualifier_values={
+            "activity": frozenset({"activity", "activity_or_abundance"})
+        })
+        qg = {"nodes": {}, "edges": {"e0": {
+            "subject": "n0", "object": "n1",
+            "qualifier_constraints": [{"qualifier_set": [
+                {"qualifier_type_id": "biolink:object_aspect_qualifier",
+                 "qualifier_value": "activity"},
+                {"qualifier_type_id": "biolink:object_direction_qualifier",
+                 "qualifier_value": "increased"},
+            ]}]}}}
+        out = expand_query_graph(qg, exp)
+        sets = out["edges"]["e0"]["qualifier_constraints"]
+        assert len(sets) == 2
+        aspects = {q["qualifier_value"] for s in sets for q in s["qualifier_set"]
+                   if q["qualifier_type_id"].endswith("object_aspect_qualifier")}
+        assert aspects == {"activity", "activity_or_abundance"}
+        directions = {q["qualifier_value"] for s in sets for q in s["qualifier_set"]
+                      if q["qualifier_type_id"].endswith("object_direction_qualifier")}
+        assert directions == {"increased"}, "un-widened value stays fixed"
+
+    def test_combination_cap_leaves_constraint_untouched(self):
+        from trapi import BiolinkExpander, expand_query_graph, _MAX_QUALIFIER_COMBINATIONS
+
+        big = frozenset(f"v{i}" for i in range(_MAX_QUALIFIER_COMBINATIONS + 5))
+        exp = BiolinkExpander(qualifier_values={"a": big, "b": big})
+        qc = {"qualifier_set": [
+            {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "a"},
+            {"qualifier_type_id": "biolink:object_direction_qualifier", "qualifier_value": "b"},
+        ]}
+        qg = {"nodes": {}, "edges": {"e0": {"subject": "n0", "object": "n1",
+                                            "qualifier_constraints": [qc]}}}
+        out = expand_query_graph(qg, exp)
+        assert out["edges"]["e0"]["qualifier_constraints"] == [qc]
+
+    def test_no_expander_means_literal_matching(self, simple_graph):
+        """The default path must be unchanged."""
+        from trapi import query
+
+        qg = {"nodes": {"n0": {"ids": ["CHEBI:1"]},
+                        "n1": {"categories": ["biolink:Gene"]}},
+              "edges": {"e0": {"subject": "n0", "object": "n1",
+                               "predicates": ["biolink:affects"]}}}
+        assert len(query(simple_graph, qg)["results"]) == 2
+
+
 class TestQueryGraphValidation:
     """Structurally invalid query graphs must raise ValueError, not KeyError."""
 
