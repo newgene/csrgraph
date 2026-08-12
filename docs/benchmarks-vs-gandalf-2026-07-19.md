@@ -127,19 +127,41 @@ expands and intersects whole frontiers in numpy; csrgraph is slow because it
 calls a Python function per frontier node.
 
 **Revised recommendation.** Close item 2 as originally specified and replace it
-with *vectorized frontier expansion*:
+with *vectorized frontier expansion*: gather all frontier rows in one ragged
+numpy operation (the same `indptr`/`repeat`/`arange` gather already used in
+`_reach_masks`' BFS) instead of per-node `_mp_expand_edges` calls, apply the
+reach mask to the gathered array, and build Python tuples only for survivors.
 
-1. Gather all frontier rows in one ragged numpy operation (the same
-   `indptr`/`repeat`/`arange` gather already used in `_reach_masks`' BFS)
-   instead of per-node `_mp_expand_edges` calls.
-2. Apply the reach mask to the gathered array — keeping csrgraph's target-aware
-   pruning, which is the part gandalf lacks.
-3. Materialize Python path tuples only for survivors, or keep them in parent-
-   pointer arrays (the `PathArrays`-style representation) and hydrate at the end.
+## Outcome: vectorized expansion implemented
 
-That combination should beat gandalf on *all* three hard cases: pruning wins
-case 1 today, and vectorization is what wins cases 2–3. Expected gain on the
-20.4 s case is most of the 19.4 s currently spent inside `_mp_expand_edges`.
+Done in `_mp_expand_frontier` + `_csr_ragged_gather`, with `match_path` now
+expanding the frontier in 100k-node chunks. A stable argsort on the frontier
+position restores node-major order after the per-relation gathers, so output is
+byte-identical to the per-node path. Results were verified unchanged on every
+case — same path counts, same distinct node-paths, same frontier sizes — and
+LMDB/ES parity still holds.
+
+| 3-hop query | Before | After | Gain | gandalf |
+| --- | --- | --- | --- | --- |
+| CHEBI:30614 → NCBIGene:1366 | 1.07 s | **0.92 s** | 1.2× | 3.60 s |
+| CHEBI:50924 → UBERON:0001062 | 9.27 s | **1.23 s** | **7.5×** | 0.13 s |
+| CHEBI:33216 → UBERON:0001062 | 20.39 s | **2.82 s** | **7.2×** | 1.11 s |
+
+Small result sets improved too: → MONDO:0005516 went 0.029 s → 0.008 s,
+→ MONDO:0012819 0.029 s → 0.012 s, and the 2-hop association case on the April
+graph 0.030 s → 0.0095 s warm.
+
+A second pass removed the flush-threshold recomputation from the inner loop
+(`len`/`min`/`max` were each running 4.5M times on the 2.2M-path query, once per
+candidate); it is now recomputed only after a flush.
+
+**Standing against gandalf after the change:** csrgraph now wins the selective
+case by 3.9× (0.92 s vs 3.60 s) and has closed the volume cases from 70× → 9.2×
+and from 18× → 2.6×. The remaining gap is the per-path Python tuple: csrgraph
+materializes `(subject, predicate, object)` triples for every path, where gandalf
+emits node quadruples into numpy arrays. Closing it further means the
+`PathArrays`-style parent-pointer representation — a larger change that alters
+the return contract, and the next thing to weigh if this workload matters.
 
 ## Caveats
 

@@ -129,6 +129,37 @@ class MatchStats:
     hop_caps: List[int] = field(default_factory=list)
 
 
+_EMPTY_I64 = np.empty(0, dtype=np.int64)
+_EMPTY_I32 = np.empty(0, dtype=np.int32)
+
+
+def _csr_ragged_gather(
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    rows: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Gather every CSR entry of *rows* in one vectorized pass.
+
+    Returns ``(src_pos, cols)``: for each gathered entry, the position in *rows*
+    it came from and the column it points at.  Entries come back grouped by row
+    in the order *rows* lists them, and within a row in CSR order — the same
+    order a per-row Python loop would produce.
+
+    This replaces the "loop over rows, slice each one" pattern, which costs a
+    Python iteration per row; here the whole frontier is one set of numpy ops.
+    """
+    starts = indptr[rows].astype(np.int64, copy=False)
+    counts = indptr[rows + 1].astype(np.int64, copy=False) - starts
+    total = int(counts.sum())
+    if total == 0:
+        return _EMPTY_I64, _EMPTY_I64
+    src_pos = np.repeat(np.arange(rows.size, dtype=np.int64), counts)
+    first_out = np.cumsum(counts) - counts          # where each row starts in the output
+    within = np.arange(total, dtype=np.int64) - np.repeat(first_out, counts)
+    cols = indices[np.repeat(starts, counts) + within]
+    return src_pos, cols
+
+
 def _strip_biolink(value: str) -> str:
     """Remove the leading ``biolink:`` prefix if present."""
     if value.startswith(BIOLINK_PREFIX):
@@ -1555,15 +1586,9 @@ class CSRGraph:
         for d in range(1, min(max_depth, self._DIST_FAR - 1) + 1):
             if frontier.size == 0:
                 break
-            # Ragged gather of every reverse-neighbour row of the frontier.
-            starts = indptr[frontier]
-            counts = indptr[frontier + 1] - starts
-            total = int(counts.sum())
-            if total == 0:
+            _, nbrs = _csr_ragged_gather(indptr, indices, frontier)
+            if nbrs.size == 0:
                 break
-            offsets = np.repeat(starts, counts)
-            within = np.arange(total) - np.repeat(np.cumsum(counts) - counts, counts)
-            nbrs = indices[offsets + within]
             nbrs = nbrs[dist[nbrs] == self._DIST_FAR]
             if nbrs.size == 0:
                 break
@@ -2109,14 +2134,31 @@ class CSRGraph:
             # plus a full category-index scan), and calling per node multiplies
             # that cost by the frontier size, which at hop 3+ is the cap.
             batch: List[tuple] = []
-            consumed = 0
+            nodes = self.nodes
+            node_to_id = self.node_to_id
+            unfinished = False   # candidates or frontier entries left unexpanded
 
-            for current_node, path_so_far in frontier:
-                consumed += 1
-                for nbr, pred in _mp_expand_edges(
-                    self, current_node, edge_spec, reach_ok
-                ):
-                    batch.append((current_node, path_so_far, nbr, pred))
+            # The frontier is expanded in chunks: one vectorized gather per
+            # relation per chunk, rather than a Python call per frontier node.
+            # Chunking bounds the transient arrays on a multi-million-node
+            # frontier while keeping the gathers large enough to amortize.
+            pos = 0
+            while pos < len(frontier):
+                chunk = frontier[pos : pos + _MP_EXPAND_CHUNK]
+                pos += len(chunk)
+                chunk_idxs = np.fromiter(
+                    (node_to_id[c] for c, _p in chunk),
+                    dtype=np.int64,
+                    count=len(chunk),
+                )
+                src, cols, rels, labels = _mp_expand_frontier(
+                    self, chunk_idxs, edge_spec, reach_ok
+                )
+                # .tolist() once: indexing numpy scalars in the inner loop costs
+                # more than the conversion.
+                src_l = src.tolist()
+                cols_l = cols.tolist()
+                rels_l = rels.tolist()
 
                 # The flush threshold adapts to how many results this hop still
                 # needs.  Always accumulating a full batch would trade per-node
@@ -2124,22 +2166,46 @@ class CSRGraph:
                 # by the first few high-degree frontier nodes needs far fewer
                 # candidates than ``_MP_FILTER_BATCH``, and expanding them
                 # anyway costs more than the calls it saves.
-                needed = hop_cap - len(next_frontier)
-                if len(batch) >= min(_MP_FILTER_BATCH, max(needed, _MP_MIN_FLUSH)):
-                    next_frontier.extend(_flush(batch))
-                    batch = []
-                    if len(next_frontier) >= hop_cap:
-                        break
+                #
+                # It only changes when ``next_frontier`` grows, i.e. after a
+                # flush -- recomputing it per candidate cost three builtin calls
+                # per candidate (4.5M each on a 2.2M-path query).
+                flush_at = min(
+                    _MP_FILTER_BATCH,
+                    max(hop_cap - len(next_frontier), _MP_MIN_FLUSH),
+                )
+                batch_len = len(batch)
+                n_cand = len(src_l)
+
+                for k, (s, c, r) in enumerate(zip(src_l, cols_l, rels_l)):
+                    current_node, path_so_far = chunk[s]
+                    batch.append((current_node, path_so_far, nodes[c], labels[r]))
+                    batch_len += 1
+
+                    if batch_len >= flush_at:
+                        next_frontier.extend(_flush(batch))
+                        batch = []
+                        batch_len = 0
+                        if len(next_frontier) >= hop_cap:
+                            unfinished = k + 1 < n_cand or pos < len(frontier)
+                            break
+                        flush_at = min(
+                            _MP_FILTER_BATCH,
+                            max(hop_cap - len(next_frontier), _MP_MIN_FLUSH),
+                        )
+
+                if len(next_frontier) >= hop_cap:
+                    break
 
             if batch and len(next_frontier) < hop_cap:
                 next_frontier.extend(_flush(batch))
                 batch = []
 
             # This hop is incomplete if the cap stopped us before the frontier
-            # was fully consumed, if a filtered batch was left unmerged, or if
+            # was fully expanded, if a filtered batch was left unmerged, or if
             # survivors had to be sliced away below.
             if (
-                consumed < len(frontier)
+                unfinished
                 or bool(batch)
                 or len(next_frontier) > hop_cap
             ):
@@ -2218,6 +2284,11 @@ _MP_FILTER_BATCH = 10_000
 # a useful number of candidates per call instead of degenerating towards one call
 # per frontier node.
 _MP_MIN_FLUSH = 256
+
+# Frontier nodes expanded per vectorized gather.  Large enough that the numpy
+# work dominates the per-chunk setup, small enough that the transient gathered
+# arrays stay bounded when the frontier runs to millions of nodes.
+_MP_EXPAND_CHUNK = 100_000
 
 
 def _resolve_node_candidates(
@@ -2356,6 +2427,75 @@ def _mp_expand_edges(
                 continue
         pairs.extend((nodes[v], pred_label) for v in row.tolist())
     return pairs
+
+
+def _mp_expand_frontier(
+    graph: CSRGraph,
+    node_idxs: np.ndarray,
+    edge_spec: EdgeSpec,
+    reach_ok: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, tuple]:
+    """Expand an entire frontier at once, vectorized.
+
+    The per-node equivalent (:func:`_mp_expand_edges`) costs a Python call per
+    frontier node, and for a wildcard EdgeSpec each of those calls walks all
+    per-predicate CSR rows.  On a wide frontier that dominates everything else:
+    profiling a 2.2M-path query put 77% of its runtime in 2.26M such calls.  Here
+    each relation is gathered once for the whole frontier instead.
+
+    Returns ``(src_pos, cols, rel_ids, labels)``:
+
+    - ``src_pos`` — index into *node_idxs* each edge came from
+    - ``cols`` — neighbour node index
+    - ``rel_ids`` — index into *labels*
+    - ``labels`` — tuple of ``biolink:``-prefixed predicate labels
+
+    *reach_ok* is applied to the gathered columns, so unreachable neighbours are
+    dropped inside numpy and never reach Python.  Output order matches the
+    per-node path exactly: grouped by frontier node, then by relation, then CSR
+    row order.
+    """
+    if isinstance(edge_spec, str):
+        rel = _strip_biolink(edge_spec)
+        csr = graph.csr_by_relation.get(rel)
+        plan: list = (
+            [] if csr is None else [(csr.indptr, csr.indices, _add_biolink(rel))]
+        )
+    else:
+        plan = graph._expansion_plan()
+
+    labels = tuple(p[2] for p in plan)
+    src_parts: list = []
+    col_parts: list = []
+    rel_parts: list = []
+
+    for rel_id, (indptr, indices, _label) in enumerate(plan):
+        src_pos, cols = _csr_ragged_gather(indptr, indices, node_idxs)
+        if cols.size == 0:
+            continue
+        if reach_ok is not None:
+            keep = reach_ok[cols]
+            if not keep.any():
+                continue
+            src_pos = src_pos[keep]
+            cols = cols[keep]
+        src_parts.append(src_pos)
+        col_parts.append(cols)
+        rel_parts.append(np.full(cols.size, rel_id, dtype=np.int32))
+
+    if not src_parts:
+        return _EMPTY_I64, _EMPTY_I64, _EMPTY_I32, labels
+
+    src = np.concatenate(src_parts)
+    cols_all = np.concatenate(col_parts)
+    rels = np.concatenate(rel_parts)
+
+    # Relations were gathered one after another, so results are relation-major.
+    # A *stable* sort on the frontier position restores node-major order while
+    # preserving relation order within each node -- byte-identical to what the
+    # per-node loop emitted.
+    order = np.argsort(src, kind="stable")
+    return src[order], cols_all[order], rels[order], labels
 
 
 def _mp_filter_edges_batch(
