@@ -1914,6 +1914,11 @@ class ElasticsearchMetadataBackend(MetadataBackend):
         A Biolink category routinely holds more than ``index.max_result_window``
         nodes, so this pages on a sort key instead of asking for one oversized
         result set.  Only the ``id`` field is fetched.
+
+        Sorting is on the ``id`` keyword field rather than ``_id``: node CURIEs
+        are unique, so ``id`` is a valid tiebreaker, and sorting on ``_id``
+        needs fielddata that Elasticsearch disallows by default
+        (``indices.id_field_data.enabled``).
         """
         page = self._ES_MAX_RESULT_WINDOW
         if limit is not None:
@@ -1926,7 +1931,7 @@ class ElasticsearchMetadataBackend(MetadataBackend):
                 "index": self._nodes_idx,
                 "query": {"term": {"category": _strip_biolink(category)}},
                 "size": page,
-                "sort": [{"_id": "asc"}],
+                "sort": [{"id": "asc"}],
                 "source_includes": ["id"],
             }
             if search_after is not None:
