@@ -298,3 +298,83 @@ selective targets are cheap, high-fan-in targets are not.
   cheap to start and to replace — a real advantage for autoscaling and rolling
   updates that the release plan in
   [`production-release-plan.md`](production-release-plan.md) can build on.
+
+---
+
+## 6. Re-test on a 3-node cluster (after the LMDB category fix)
+
+Everything above was measured on a single ES node in a 7.45 GiB / 8-CPU podman VM,
+and before `filter_nodes` stopped scanning whole categories. Both were redone:
+the VM is now **12 CPUs / 29.8 GiB**, Elasticsearch is a **3-node 9.5.0 cluster**
+(4 GB heap each, security off), and the client uses all three node URLs with
+`connections_per_node=64`.
+
+Reindexed at 3 shards / 1 replica: 1,759,470 node docs and 28,105,517 edge docs,
+3 balanced shards of ~9.37M edges, primaries and replicas on separate nodes,
+green. The build took 1169 s — slightly *faster* than the single-node 1207 s
+despite writing twice the data, because indexing is bound by the single-process
+Python client (node CPU sat at 7% throughout), not by the cluster.
+
+LMDB and ES still **agree on every compared query**.
+
+### Three of the earlier conclusions were wrong
+
+**The connection pool was not the ceiling.** The document above suggests the
+~50 req/s ES plateau was partly the client's default `connections_per_node=10`
+queuing requests. Raising it to 64 did not move the peak: a 1-shard index on the
+cluster peaks at **50.96 req/s**, against ~49 req/s measured at the default. The
+pool mattered for *shape* (the 3-shard config can now scale past 8 threads) but
+not for the ceiling.
+
+**More shards made throughput worse, and not for the reason predicted.** A/B on
+the same cluster with the same pool and query:
+
+| Config | Median latency | 1 thr | 8 thr | 32 thr |
+| --- | --- | --- | --- | --- |
+| 3 shards + 1 replica | 255.6 ms | 3.99 | 26.35 | 36.37 req/s |
+| **1 shard + 1 replica** | 257.0 ms | 3.91 | 32.22 | **50.96 req/s** |
+
+Single-query latency is *identical*, so fan-out coordination is not the cost — the
+prediction that more shards would trade latency for parallelism was wrong. The
+real cost is search-thread occupancy: a 3-shard query consumes three search
+threads instead of one, so the thread pool saturates at a third of the request
+rate. **For many small concurrent queries, use one shard and add replicas**;
+shards only pay when a single query does enough per-shard work to amortise them.
+
+**ES per-call cost is not `_source` fetching.** One `filter_nodes` call over 500
+candidate ids costs ~52.9 ms; restricting to `source_includes=["id"]` gives
+51.9 ms and disabling `_source` entirely 50.5 ms. The ~50 ms is the `ids`-plus-term
+query itself, and several such calls are what make up a 255 ms request. There is
+no easy client-side win here.
+
+### The LMDB/ES crossover has reversed
+
+With `filter_nodes` probing the category index instead of scanning it, LMDB now
+wins every metadata-bound operation measured:
+
+| Operation | LMDB | ES (3-node) | Ratio |
+| --- | --- | --- | --- |
+| `nodes_by_category(Disease)` | 0.006 s | 2.54 s | LMDB **420×** |
+| `nodes_by_category(Gene)` | 0.175 s | 1.70 s | LMDB **10×** |
+| `nodes_by_category(SmallMolecule)`, 1.06M ids | 0.865 s | 31.96 s | LMDB **37×** |
+| Edge filter (`knowledge_level`) | 0.008 s | 0.291 s | LMDB **36×** |
+| 2-hop category query, 1 worker | 34.3 req/s | 3.9 req/s | LMDB **8.8×** |
+| Peak throughput | **267.9 req/s** (8 processes) | 50.96 req/s (32 threads) | LMDB **5.3×** |
+
+The single-node ES numbers earlier in this document showed ES *ahead* on
+candidate-list filtering (5.0 vs 2.0 req/s). That comparison was against the
+O(|category|) scan; it no longer holds in either direction — LMDB is now ahead by
+~9× on the same query.
+
+ES keeps three things LMDB cannot offer: full-text `resolve` (no LMDB
+equivalent), horizontal headroom beyond one host, and thread-friendly
+concurrency. But since LMDB with processes reaches 5× the peak of ES with
+threads, thread-friendliness alone is no longer a reason to choose it. **Prefer
+LMDB for metadata filtering and keep ES for name resolution** — which is what
+`HybridMetadataBackend` exists to express, and its routing thresholds should be
+re-derived from this table.
+
+The cluster does buy real behavioural fidelity — fan-out, replica routing, shard
+allocation — and that is what exposed the shard-count finding. It does not buy
+hardware fidelity: three nodes share one page cache, one NVMe, and a loopback
+network, so absolute figures remain single-box numbers.

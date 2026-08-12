@@ -53,14 +53,17 @@ def pick_start(graph: CSRGraph) -> str:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stem", default="translator_kg_2026-07-19")
-    ap.add_argument("--es-host", default="http://localhost:9200")
+    ap.add_argument("--es-host", default="http://localhost:9200,http://localhost:9201,http://localhost:9202",
+                    help="comma-separated node URLs")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 
     snapshot = DATA / f"{args.stem}.csrgraph.pkl.zst"
     lmdb = LMDBMetadataBackend(str(DATA / f"{args.stem}.metadata.lmdb"))
-    es = ElasticsearchMetadataBackend(args.es_host, index_prefix=args.stem)
+    es = ElasticsearchMetadataBackend(
+        args.es_host.split(","), index_prefix=args.stem, connections_per_node=64
+    )
 
     g = CSRGraph.load(str(snapshot))
     print(f"graph: {g.num_nodes:,} nodes, {g.csr_merged.nnz:,} edges, "

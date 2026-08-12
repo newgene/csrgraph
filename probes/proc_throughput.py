@@ -19,7 +19,8 @@ def child(backend, seconds):
         db = B(str(DATA / f"{STEM}.metadata.lmdb"))
     else:
         from metadata_db import ElasticsearchMetadataBackend as B
-        db = B("http://localhost:9200", index_prefix=STEM)
+        db = B([f"http://localhost:{p}" for p in (9200, 9201, 9202)],
+               index_prefix=STEM, connections_per_node=64)
     g = CSRGraph.load(str(DATA / f"{STEM}.csrgraph.pkl.zst"))
     spec = [START, None, None, None, {"category": CATEGORY}]
     g.match_path(spec, limit=500, node_subclassing=False, db=db)  # warm

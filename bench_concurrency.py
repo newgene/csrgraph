@@ -30,6 +30,7 @@ from pathlib import Path
 
 DATA = Path("~/tmp/csrgraph_data").expanduser()
 STEM = "translator_kg_2026-07-19"
+ES_HOSTS = [f"http://localhost:{p}" for p in (9200, 9201, 9202)]
 
 # Fixtures: a pinned 3-hop pair (pure topology, no backend calls) and a
 # category-tail association (one backend call per hop batch).
@@ -69,7 +70,13 @@ def load(backend: str):
     elif backend == "es":
         from metadata_db import ElasticsearchMetadataBackend
 
-        db = ElasticsearchMetadataBackend("http://localhost:9200", index_prefix=STEM)
+        # All cluster nodes so the client round-robins, and a pool larger than
+        # any concurrency we drive: connections_per_node caps in-flight requests
+        # per node, so leaving it at the default 10 measures the client's queue
+        # rather than Elasticsearch.
+        db = ElasticsearchMetadataBackend(
+            ES_HOSTS, index_prefix=STEM, connections_per_node=64
+        )
     if db is not None:
         g.set_db(db)
     return g, db
