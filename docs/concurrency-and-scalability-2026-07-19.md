@@ -196,14 +196,25 @@ Ordered by measured value per unit of effort.
 - **ES → threads are fine and preferable.** ×8.16 on 8 cores, and one process
   serving many concurrent requests keeps the graph loaded once. A threaded or
   async server plus a scaled ES cluster is the higher-ceiling configuration.
-- **LMDB + `PYTHON_GIL=0` → the fastest option, and unsupported.** Since the
-  collapse is GIL convoying rather than unsafety ([§2.1](#21-lmdb-is-thread-safe-the-collapse-is-the-gil)),
-  forcing the GIL off makes the same 8-thread workload 31× faster and restores
-  scaling (×2.03 on cursor scans, ~395k `get_node`/s at 4 threads). Correct in
-  every test run here, but py-lmdb has not declared free-threading support
-  ([#458](https://github.com/jnwatson/py-lmdb/issues/458), open), so this is a
-  risk-accepted override: benchmark it, pin the py-lmdb version, and keep a
-  process-based fallback. Worth re-testing when #458 lands.
+- **LMDB + `PYTHON_GIL=0` → not worth it.** Forcing the GIL off does fix the
+  collapse, and it is correct in every test run here
+  ([§2.1](#21-lmdb-is-thread-safe-the-collapse-is-the-gil)) — but on the *real*
+  query path it only reaches ×1.68 (peak 3.8 req/s at 4 threads), while plain
+  processes reach **15.37 req/s at 8 workers (×7.57)**. Processes are ~4× faster
+  *and* supported. The 31× figure quoted in §2.1 is a tight-loop micro-benchmark;
+  it does not carry over to a workload whose per-request cost is dominated by the
+  category scan. Reach for `PYTHON_GIL=0` only if something else forces you into
+  one process — a shared in-process cache, or a memory budget that cannot absorb
+  N × 0.50 GB — and then pin py-lmdb and re-test on
+  [#458](https://github.com/jnwatson/py-lmdb/issues/458).
+
+Measured throughput on the same 2-hop category query, LMDB backend:
+
+| Configuration | 1 | 2 | 4 | 8 |
+| --- | --- | --- | --- | --- |
+| Threads, GIL on | 2.1 | 0.9 | 0.4 | 0.1 |
+| Threads, `PYTHON_GIL=0` | 2.3 | 2.9 | 3.8 | 2.5 |
+| **Processes** | 2.03 | 4.14 | 8.24 | **15.37** |
 
 ### 5.2 Move `id_maps` out of the Python heap — the biggest single win
 
