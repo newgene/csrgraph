@@ -98,6 +98,12 @@ PathEdge = Tuple[str, Optional[str], str]
 NodeSpec = str | dict | None
 EdgeSpec = str | dict | None
 
+#: Default hop bound for :meth:`CSRGraph.all_paths`.  Simple-path enumeration is
+#: exponential in depth, so an unbounded default is a footgun on a real KG: five
+#: hops already covers the Translator query shapes this library targets (2–3 hops
+#: typically, rarely beyond four).  Pass ``max_depth=None`` to opt out explicitly.
+DEFAULT_ALL_PATHS_MAX_DEPTH = 5
+
 
 @dataclass
 class MatchStats:
@@ -1618,7 +1624,7 @@ class CSRGraph:
         source: str,
         target: str,
         relation: Optional[str] = None,
-        max_depth: Optional[int] = None,
+        max_depth: Optional[int] = DEFAULT_ALL_PATHS_MAX_DEPTH,
         node_subclassing: bool = False,
     ) -> List[List[PathEdge]]:
         """Return all simple paths from *source* to *target*.
@@ -1627,6 +1633,16 @@ class CSRGraph:
 
         Parameters
         ----------
+        max_depth:
+            Maximum number of hops, defaulting to
+            :data:`DEFAULT_ALL_PATHS_MAX_DEPTH` (5).  Enumeration is a recursive
+            DFS whose cost grows exponentially with depth, so on a graph of any
+            size an unbounded search does not finish and deep chains can also
+            exhaust the recursion limit.  ``None`` removes the bound explicitly —
+            reasonable on a small or sparse graph, a bad idea otherwise.
+
+            Note that this bounds *depth*, not the number of results: a shallow
+            search through a hub can still return very many paths.
         node_subclassing:
             When ``True``, paths may start from any subclass of *source* and
             end at any subclass of *target* (both sets expanded transitively
@@ -2293,6 +2309,7 @@ _MP_FILTER_BATCH = 10_000
 # a useful number of candidates per call instead of degenerating towards one call
 # per frontier node.
 _MP_MIN_FLUSH = 256
+
 
 # Frontier nodes expanded per vectorized gather.  Large enough that the numpy
 # work dominates the per-chunk setup, small enough that the transient gathered

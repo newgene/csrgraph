@@ -205,6 +205,26 @@ def test_sqlite_backend_build_and_filter(archive: Path, tmp_path: Path):
         db.close()
 
 
+def test_all_paths_depth_is_bounded_by_default():
+    """all_paths must not default to an unbounded exponential DFS."""
+    from csrgraph_kgx import DEFAULT_ALL_PATHS_MAX_DEPTH
+
+    # A chain longer than the default bound: N:0 -> N:1 -> ... -> N:8
+    chain = [(f"N:{i}", "biolink:related_to", f"N:{i+1}") for i in range(8)]
+    g = CSRGraph(chain)
+
+    # The only route is 8 hops, past the default of 5, so nothing is returned.
+    assert g.all_paths("N:0", "N:8") == []
+    assert DEFAULT_ALL_PATHS_MAX_DEPTH == 5
+
+    # Within the bound it is found.
+    assert len(g.all_paths("N:0", "N:5")) == 1
+
+    # An explicit bound and explicit None both still work.
+    assert len(g.all_paths("N:0", "N:8", max_depth=8)) == 1
+    assert len(g.all_paths("N:0", "N:8", max_depth=None)) == 1
+
+
 def test_sqlite_nodes_by_category(archive: Path, tmp_path: Path):
     """nodes_by_category answers from the index, agreeing with filter_nodes."""
     db = SQLiteMetadataBackend.build(
