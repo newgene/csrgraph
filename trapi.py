@@ -247,9 +247,12 @@ def query(
         bindings = _general_match(graph, qnodes, qedges, limit)
     else:
         try:
-            ordered_node_keys, ordered_edge_keys = _linearise(qnodes, qedges)
+            ordered_node_keys, ordered_edge_keys, hop_dirs = _linearise(
+                qnodes, qedges
+            )
             bindings = _linear_query(
                 graph, qnodes, qedges, ordered_node_keys, ordered_edge_keys, limit,
+                hop_dirs,
             )
         except ValueError:
             # Branching or cyclic — use the general subgraph matcher.
@@ -274,6 +277,7 @@ def _linear_query(
     ordered_node_keys: list[str],
     ordered_edge_keys: list[str],
     limit: int,
+    hop_directions: list[bool] | None = None,
 ) -> list[Binding]:
     """Execute a linear-chain query via match_path and convert to bindings.
 
@@ -311,16 +315,24 @@ def _linear_query(
             start_id_override=start_id,
         )
         remaining = limit - len(bindings)
-        raw_paths = graph.match_path(path_spec, limit=remaining)
+        raw_paths = graph.match_path(
+            path_spec, limit=remaining, hop_directions=hop_directions
+        )
 
         for path in raw_paths:
             nodes: dict[str, str] = {}
             edges: dict[str, tuple] = {}
 
             if path:
-                nodes[ordered_node_keys[0]] = path[0][0]
-                for hop_idx, (_, _, obj) in enumerate(path):
-                    nodes[ordered_node_keys[hop_idx + 1]] = obj
+                dirs = hop_directions or [True] * len(path)
+                # A reverse hop stores (neighbour, pred, frontier_node), so the
+                # chain positions are swapped relative to a forward hop.
+                first_subj, _, first_obj = path[0]
+                nodes[ordered_node_keys[0]] = first_subj if dirs[0] else first_obj
+                for hop_idx, (subj, _, obj) in enumerate(path):
+                    nodes[ordered_node_keys[hop_idx + 1]] = (
+                        obj if dirs[hop_idx] else subj
+                    )
 
             # Post-filter: check multi-predicate edges.
             skip = False
@@ -345,8 +357,14 @@ def _linear_query(
 def _linearise(
     qnodes: dict[str, dict],
     qedges: dict[str, dict],
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[bool]]:
     """Convert a QueryGraph into an ordered linear chain of node/edge keys.
+
+    Returns ``(nodes, edges, directions)``.  ``directions[i]`` is ``True`` when hop
+    *i* is traversed along the edge (subject -> object) and ``False`` when it is
+    traversed against it, which happens whenever the chain is anchored at an
+    edge's object end -- the "what treats disease X?" shape.  Dropping this flag
+    silently produced empty results for every such query.
 
     Raises ``ValueError`` for disconnected, branching, or cyclic query graphs.
     """
@@ -364,6 +382,7 @@ def _linearise(
 
     ordered_nodes: list[str] = [start]
     ordered_edges: list[str] = []
+    directions: list[bool] = []
     visited_edges: set[str] = set()
     visited_nodes: set[str] = {start}
 
@@ -381,12 +400,13 @@ def _linearise(
         visited_nodes.add(nbr)
         ordered_edges.append(ek)
         ordered_nodes.append(nbr)
+        directions.append(is_fwd)
         current = nbr
 
     if len(ordered_nodes) != len(qnodes) or len(ordered_edges) != len(qedges):
         raise ValueError("Non-linear query graph")
 
-    return ordered_nodes, ordered_edges
+    return ordered_nodes, ordered_edges, directions
 
 
 # ──────────────────────────────────────────────────────────────────────────────

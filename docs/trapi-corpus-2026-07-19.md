@@ -48,9 +48,47 @@ absent, so the corpus exercises real data here.
 | `mvp2_chem_affects_open_gene` | shepherd | 11.3 ms, 108 | 515 ms, 804 | csr ⊂ gan (108 shared) |
 | `pathfinder_drug_disease` | pathfinder | `KeyError` | `KeyError` | both raise |
 
-## Accuracy findings
+## FIXED: the direction defect
 
-### 1. Open subject + pinned object returns nothing (csrgraph)
+`_linearise` now returns the per-hop direction it always computed, `_linear_query`
+forwards it, and `match_path` accepts `hop_directions` and walks a reverse hop over
+a lazily built transposed per-relation plan (`_reverse_expansion_plan`). Emitted
+`PathEdge` tuples keep true `(subject, predicate, object)` orientation whichever way
+the hop was walked, so knowledge-graph edges and bindings come out correct.
+
+Re-running the corpus after the fix:
+
+| qtype | before | after | gandalf | verdict |
+| --- | --- | --- | --- | --- |
+| `one_hop_lookup_pinned` | 1 | 1 | 1 | **IDENTICAL** |
+| `one_hop_lookup_open` | **0** | 140 | 140 | **IDENTICAL** |
+| `one_hop_no_predicate` | **0** | 200 | 2,957 | subset (limit cap) |
+| `two_hop_lookup` | 200 | 200 | 62,536 | subset (limit cap) |
+| `batch_lookup` | **0** | 200 | 548 | subset (limit cap) |
+| `mvp1_heavy` | **0** | 70 | 70 | **IDENTICAL** |
+| `mvp1_medium` | **0** | 140 | 140 | **IDENTICAL** |
+| `mvp1_light` | **0** | 48 | 49 | 1 missing (predicate hierarchy) |
+| `mvp2_chem_affects_gene` | **0** | 99 | 979 | subset (qualifier hierarchy) |
+| `mvp2_chem_affects_open_gene` | 108 | 108 | 804 | subset (qualifier hierarchy) |
+
+Four queries now match gandalf exactly. Every remaining difference is a strict
+subset of gandalf's answers — csrgraph returns nothing gandalf does not — and each
+has an identified cause:
+
+* **`limit=200` cap** on three queries. Not a defect.
+* **No Biolink predicate-hierarchy expansion.** `mvp1_light`'s single missing answer
+  is `CHEBI:135939`, which connects to Alzheimer's by `applied_to_treat` and
+  `treats_or_applied_or_studied_to_treat` — *not* by the queried `treats`. gandalf
+  expands the queried predicate to its BMT descendants; csrgraph matches literally.
+* **No qualifier-value hierarchy expansion**, as previously known, for the two MVP2
+  rows.
+
+The two hierarchy gaps are the same underlying feature — Biolink Model expansion —
+and are now the largest remaining accuracy difference between the engines.
+
+## Accuracy findings (as originally measured)
+
+### 1. Open subject + pinned object returns nothing (csrgraph) — NOW FIXED
 
 Isolated with one edge known to exist (`CHEBI:6801 -[treats]-> MONDO:0005148`,
 confirmed present in the metadata store):

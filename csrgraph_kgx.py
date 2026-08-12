@@ -480,6 +480,30 @@ class CSRGraph:
             self._expand_plan_cache = plan
         return plan
 
+    def _reverse_expansion_plan(self) -> List[Tuple[np.ndarray, np.ndarray, str]]:
+        """Like :meth:`_expansion_plan` but over transposed per-relation matrices.
+
+        Answers "which nodes point *at* this one, and by which predicate" — needed
+        whenever a query pins the object end of an edge and leaves the subject
+        open ("what treats X?").  ``csr_merged``'s transpose cannot serve this,
+        because ``edge_predicate_ids`` keeps only one representative predicate per
+        node pair.
+
+        Built lazily and cached: the transposes cost roughly what
+        ``csr_by_relation`` does (~550 MB on translator_kg), so graphs that never
+        run a reverse hop never pay for it.
+        """
+        plan = getattr(self, "_reverse_plan_cache", None)
+        if plan is None:
+            plan = [
+                (csr_t.indptr, csr_t.indices, _add_biolink(rel))
+                for rel, csr_t in (
+                    (rel, csr.T.tocsr()) for rel, csr in self.csr_by_relation.items()
+                )
+            ]
+            self._reverse_plan_cache = plan
+        return plan
+
     def _relation_id_dtype(self) -> np.dtype:
         n = max(len(self.relations), 1)
         if n <= np.iinfo(np.uint8).max:
@@ -1932,6 +1956,7 @@ class CSRGraph:
         node_subclassing: bool = ...,
         db: MetadataBackend | None = ...,
         return_stats: Literal[False] = ...,
+        hop_directions: Optional[List[bool]] = ...,
     ) -> List[List[PathEdge]]: ...
 
     @overload
@@ -1943,6 +1968,7 @@ class CSRGraph:
         db: MetadataBackend | None = ...,
         *,
         return_stats: Literal[True],
+        hop_directions: Optional[List[bool]] = ...,
     ) -> Tuple[List[List[PathEdge]], MatchStats]: ...
 
     def match_path(
@@ -1952,6 +1978,7 @@ class CSRGraph:
         node_subclassing: bool = False,
         db: MetadataBackend | None = None,
         return_stats: bool = False,
+        hop_directions: Optional[List[bool]] = None,
     ) -> List[List[PathEdge]] | Tuple[List[List[PathEdge]], MatchStats]:
         """Find all paths matching a fixed-length node/edge pattern.
 
@@ -1966,6 +1993,14 @@ class CSRGraph:
             When ``True`` return ``(paths, MatchStats)`` instead of just the
             paths, so callers can tell a complete result from a capped one.
             Truncation is logged as a warning either way.
+        hop_directions : list[bool], optional
+            Per-hop edge orientation, one entry per hop.  ``True`` (the default
+            for every hop) walks ``subject -> object``; ``False`` walks
+            ``object -> subject``, i.e. "which nodes point at this one".  Needed
+            when a pattern is anchored at the object end of an edge — without it
+            such a pattern matches nothing, since the walk would follow edges the
+            wrong way.  Returned ``PathEdge`` tuples always carry the true
+            ``(subject, predicate, object)`` orientation regardless.
         path_spec : list
             Alternating ``[NodeSpec, EdgeSpec, NodeSpec, EdgeSpec, ..., NodeSpec]``.
             Length must be odd and >= 3 (at least one hop).
@@ -2041,6 +2076,15 @@ class CSRGraph:
         node_specs: List[NodeSpec] = path_spec[0::2]
         edge_specs: List[EdgeSpec] = path_spec[1::2]
 
+        if hop_directions is None:
+            hop_directions = [True] * len(edge_specs)
+        elif len(hop_directions) != len(edge_specs):
+            raise ValueError(
+                f"hop_directions has {len(hop_directions)} entries for "
+                f"{len(edge_specs)} hops"
+            )
+        all_forward = all(hop_directions)
+
         stats = MatchStats()
 
         def _done(paths: List[List[PathEdge]]):
@@ -2081,8 +2125,10 @@ class CSRGraph:
         end_ids = _pinned_node_ids(
             node_specs[-1], self, node_subclassing=node_subclassing
         )
+        # The distance bound is computed over forward topology, so it is only
+        # admissible when every hop is walked forward.
         reach_masks: Optional[List[np.ndarray]] = None
-        if end_ids and n_hops >= 3:
+        if end_ids and n_hops >= 3 and all_forward:
             start_ids = [
                 self.node_to_id[n] for n in start_nodes if n in self.node_to_id
             ]
@@ -2102,6 +2148,14 @@ class CSRGraph:
             is_last_hop = hop == n_hops - 1
             hop_cap = limit if is_last_hop else intermediate_cap
             next_frontier: List[tuple[str, List[PathEdge]]] = []
+            # True: walk subject -> object.  False: walk object -> subject, so the
+            # neighbour found is the edge's *subject* and the frontier node is its
+            # object.  Emitted PathEdges keep true orientation either way.
+            forward = hop_directions[hop]
+
+            def _edge(cur: str, pred: str, nbr: str, fwd: bool = forward) -> PathEdge:
+                """The edge as it exists in the graph, whichever way it was walked."""
+                return (cur, pred, nbr) if fwd else (nbr, pred, cur)
 
             # Nodes that can still reach the pinned tail after this hop.  Passed
             # into expansion so unreachable neighbours are masked off the CSR row
@@ -2129,10 +2183,12 @@ class CSRGraph:
                 if isinstance(edge_spec, dict):
                     survivors = _mp_filter_edges_batch(
                         db,
-                        [(cur, pred, nbr) for cur, _p, nbr, pred in pending],
+                        [_edge(cur, pred, nbr) for cur, _p, nbr, pred in pending],
                         edge_spec,
                     )
-                    pending = [c for c in pending if (c[0], c[3], c[2]) in survivors]
+                    pending = [
+                        c for c in pending if _edge(c[0], c[3], c[2]) in survivors
+                    ]
                     if not pending:
                         return []
 
@@ -2147,7 +2203,7 @@ class CSRGraph:
                     pending = [c for c in pending if c[2] in allowed]
 
                 return [
-                    (nbr, path_so_far + [(cur, pred, nbr)])
+                    (nbr, path_so_far + [_edge(cur, pred, nbr)])
                     for cur, path_so_far, nbr, pred in pending
                 ]
 
@@ -2177,7 +2233,7 @@ class CSRGraph:
                     count=len(chunk),
                 )
                 src, cols, rels, labels = _mp_expand_frontier(
-                    self, chunk_idxs, edge_spec, reach_ok
+                    self, chunk_idxs, edge_spec, reach_ok, reverse=not forward
                 )
                 # .tolist() once: indexing numpy scalars in the inner loop costs
                 # more than the conversion.
@@ -2205,6 +2261,7 @@ class CSRGraph:
                 for k, (s, c, r) in enumerate(zip(src_l, cols_l, rels_l)):
                     current_node, path_so_far = chunk[s]
                     batch.append((current_node, path_so_far, nodes[c], labels[r]))
+
                     batch_len += 1
 
                     if batch_len >= flush_at:
@@ -2460,6 +2517,7 @@ def _mp_expand_frontier(
     node_idxs: np.ndarray,
     edge_spec: EdgeSpec,
     reach_ok: Optional[np.ndarray] = None,
+    reverse: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, tuple]:
     """Expand an entire frontier at once, vectorized.
 
@@ -2481,14 +2539,16 @@ def _mp_expand_frontier(
     per-node path exactly: grouped by frontier node, then by relation, then CSR
     row order.
     """
+    full_plan = (
+        graph._reverse_expansion_plan() if reverse else graph._expansion_plan()
+    )
     if isinstance(edge_spec, str):
-        rel = _strip_biolink(edge_spec)
-        csr = graph.csr_by_relation.get(rel)
-        plan: list = (
-            [] if csr is None else [(csr.indptr, csr.indices, _add_biolink(rel))]
-        )
+        # One relation only: pick it out of the plan so forward and reverse share
+        # the same lookup path.
+        want = _add_biolink(_strip_biolink(edge_spec))
+        plan: list = [entry for entry in full_plan if entry[2] == want]
     else:
-        plan = graph._expansion_plan()
+        plan = full_plan
 
     labels = tuple(p[2] for p in plan)
     src_parts: list = []

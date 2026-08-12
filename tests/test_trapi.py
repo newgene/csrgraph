@@ -95,9 +95,10 @@ class TestLinearise:
 
         qnodes = {"n0": {"ids": ["CHEBI:1"]}, "n1": {}}
         qedges = {"e0": {"subject": "n0", "object": "n1"}}
-        nodes, edges = _linearise(qnodes, qedges)
+        nodes, edges, dirs = _linearise(qnodes, qedges)
         assert nodes == ["n0", "n1"]
         assert edges == ["e0"]
+        assert dirs == [True]        # walked subject -> object
 
     def test_two_hop(self):
         from trapi import _linearise
@@ -107,9 +108,10 @@ class TestLinearise:
             "e0": {"subject": "n0", "object": "n1"},
             "e1": {"subject": "n1", "object": "n2"},
         }
-        nodes, edges = _linearise(qnodes, qedges)
+        nodes, edges, dirs = _linearise(qnodes, qedges)
         assert nodes == ["n0", "n1", "n2"]
         assert edges == ["e0", "e1"]
+        assert dirs == [True, True]
 
     def test_pinned_node_chosen_as_start(self):
         """The node with ids should be chosen as start even if listed last."""
@@ -117,8 +119,24 @@ class TestLinearise:
 
         qnodes = {"n1": {}, "n0": {"ids": ["CHEBI:1"]}}
         qedges = {"e0": {"subject": "n0", "object": "n1"}}
-        nodes, edges = _linearise(qnodes, qedges)
+        nodes, edges, _dirs = _linearise(qnodes, qedges)
         assert nodes[0] == "n0"
+
+    def test_object_anchored_chain_is_marked_reverse(self):
+        """Pinning the object means hop 0 is walked against the edge.
+
+        This flag used to be computed and then dropped, which made every
+        "what treats disease X?" query return nothing.
+        """
+        from trapi import _linearise
+
+        qnodes = {"n0": {"categories": ["biolink:ChemicalEntity"]},
+                  "n1": {"ids": ["MONDO:1"]}}
+        qedges = {"e0": {"subject": "n0", "object": "n1"}}
+        nodes, edges, dirs = _linearise(qnodes, qedges)
+        assert nodes == ["n1", "n0"]   # starts from the pinned object
+        assert edges == ["e0"]
+        assert dirs == [False]         # traversed object -> subject
 
     def test_disconnected_raises(self):
         from trapi import _linearise
