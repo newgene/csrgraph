@@ -205,6 +205,35 @@ def test_sqlite_backend_build_and_filter(archive: Path, tmp_path: Path):
         db.close()
 
 
+def test_es_filter_pushdown_excludes_analyzed_and_unmapped_fields():
+    """Only keyword fields may be pushed to ES as term queries.
+
+    A ``term`` query on an unmapped field, or on an analyzed ``text`` field,
+    matches nothing rather than erroring — silently turning "filter on this"
+    into "return nothing". Those filters must be routed to the Python side.
+    Needs no server: it checks the routing decision, not the query.
+    """
+    from metadata_db import ElasticsearchMetadataBackend as ES
+
+    # 'name' is mapped but text-analyzed; 'information_content' is not mapped.
+    assert "id" in ES._NODE_MAPPED
+    assert "category" in ES._NODE_MAPPED
+    assert "name" not in ES._NODE_MAPPED
+    assert "information_content" not in ES._NODE_MAPPED
+    assert {"subject", "predicate", "object", "knowledge_level", "agent_type"} <= ES._EDGE_MAPPED
+
+    push, py = ES._split_filters(
+        {"id": "X:1", "name": "insulin", "information_content": "88.2"},
+        ES._NODE_MAPPED,
+    )
+    assert push == {"id": "X:1"}
+    assert py == {"name": "insulin", "information_content": "88.2"}
+
+    rows = [{"id": "a", "name": "insulin"}, {"id": "b", "name": "other"}]
+    assert ES._apply_py_filters(rows, {"name": "insulin"}) == [rows[0]]
+    assert ES._apply_py_filters(rows, {}) == rows
+
+
 def test_all_paths_depth_is_bounded_by_default():
     """all_paths must not default to an unbounded exponential DFS."""
     from csrgraph_kgx import DEFAULT_ALL_PATHS_MAX_DEPTH

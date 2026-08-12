@@ -1572,6 +1572,26 @@ class LMDBMetadataBackend(MetadataBackend):
 # Elasticsearch backend
 # ===========================================================================
 
+def _es_term_queryable(mapping: dict) -> frozenset[str]:
+    """Field names a ``term`` query can match exactly.
+
+    Two ways a filter can silently match nothing rather than erroring:
+
+    * **Unmapped fields.**  Both mappings are ``dynamic: False``, so any other
+      field lives in ``_source`` but is not indexed at all.
+    * **Analyzed fields.**  ``name`` is ``text``, so a ``term`` query is
+      compared against analyzed tokens rather than the original string, and an
+      exact-value filter never matches.
+
+    Only ``keyword`` fields are safe to push down; everything else is filtered
+    client-side, mirroring how the SQL backends split indexed columns from
+    Python post-filtering.
+    """
+    props = mapping["mappings"]["properties"]
+    return frozenset(
+        k for k, spec in props.items() if spec.get("type") == "keyword"
+    )
+
 class ElasticsearchMetadataBackend(MetadataBackend):
     """Elasticsearch-backed metadata store.
 
@@ -1631,6 +1651,33 @@ class ElasticsearchMetadataBackend(MetadataBackend):
             },
         },
     }
+
+    #: Filters on these can be pushed into Elasticsearch; the rest run in Python.
+    #: Derived from the mappings so they cannot drift out of sync with them.
+    _NODE_MAPPED: frozenset[str] = _es_term_queryable(_NODES_MAPPING)
+    _EDGE_MAPPED: frozenset[str] = _es_term_queryable(_EDGES_MAPPING)
+
+    @staticmethod
+    def _split_filters(
+        extra_filters: dict | None,
+        mapped: frozenset[str],
+    ) -> tuple[dict, dict]:
+        """Split *extra_filters* into (pushed to Elasticsearch, applied in Python)."""
+        if not extra_filters:
+            return {}, {}
+        pushdown = {k: v for k, v in extra_filters.items() if k in mapped}
+        py_side = {k: v for k, v in extra_filters.items() if k not in mapped}
+        return pushdown, py_side
+
+    @staticmethod
+    def _apply_py_filters(rows: list[dict], py_filters: dict) -> list[dict]:
+        """Filter *rows* on fields Elasticsearch cannot query."""
+        if not py_filters:
+            return rows
+        return [
+            r for r in rows
+            if all(str(r.get(k)) == str(v) for k, v in py_filters.items())
+        ]
 
     def __init__(
         self,
@@ -1956,9 +2003,9 @@ class ElasticsearchMetadataBackend(MetadataBackend):
         extra_must: list[dict] = []
         if category:
             extra_must.append({"term": {"category": _strip_biolink(category)}})
-        if extra_filters:
-            for k, v in extra_filters.items():
-                extra_must.append({"term": {k: str(v)}})
+        pushdown, py_filters = self._split_filters(extra_filters, self._NODE_MAPPED)
+        for k, v in pushdown.items():
+            extra_must.append({"term": {k: str(v)}})
 
         # Batch node IDs in chunks to stay within ES limits.
         # The ``ids`` query and ``size`` parameter both have practical caps
@@ -1977,7 +2024,7 @@ class ElasticsearchMetadataBackend(MetadataBackend):
             results.extend(
                 self._normalise_node(h["_source"]) for h in resp["hits"]["hits"]
             )
-        return results
+        return self._apply_py_filters(results, py_filters)
 
     def nodes_by_category(
         self,
@@ -2045,6 +2092,9 @@ class ElasticsearchMetadataBackend(MetadataBackend):
                 no_pred.append((subj, obj))
 
         results: list[dict] = []
+        # Only mapped fields can be pushed into Elasticsearch; the rest must be
+        # filtered client-side or they would silently match nothing.
+        pushdown, py_filters = self._split_filters(extra_filters, self._EDGE_MAPPED)
 
         # ── Known-predicate edges: msearch (one HTTP round-trip per batch) ───
         # ES processes all sub-queries in parallel server-side.
@@ -2067,9 +2117,8 @@ class ElasticsearchMetadataBackend(MetadataBackend):
                         must.append({"term": {"knowledge_level": knowledge_level}})
                     if agent_type:
                         must.append({"term": {"agent_type": agent_type}})
-                    if extra_filters:
-                        for k, v in extra_filters.items():
-                            must.append({"term": {k: str(v)}})
+                    for k, v in pushdown.items():
+                        must.append({"term": {k: str(v)}})
                     searches.append({"index": self._edges_idx})
                     searches.append({"query": {"bool": {"must": must}}, "size": per_pair})
                 resp = self._es.msearch(searches=searches)
@@ -2096,9 +2145,8 @@ class ElasticsearchMetadataBackend(MetadataBackend):
                         must_np.append({"term": {"knowledge_level": knowledge_level}})
                     if agent_type:
                         must_np.append({"term": {"agent_type": agent_type}})
-                    if extra_filters:
-                        for k, v in extra_filters.items():
-                            must_np.append({"term": {k: str(v)}})
+                    for k, v in pushdown.items():
+                        must_np.append({"term": {k: str(v)}})
                     should.append({"bool": {"must": must_np}})
                 resp = self._es.search(
                     index=self._edges_idx,
@@ -2108,7 +2156,7 @@ class ElasticsearchMetadataBackend(MetadataBackend):
                 for hit in resp["hits"]["hits"]:
                     results.append(self._normalise_edge(hit["_source"]))
 
-        return results
+        return self._apply_py_filters(results, py_filters)
 
     @staticmethod
     def _normalise_node(data: dict) -> dict:

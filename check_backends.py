@@ -27,10 +27,16 @@ DATA = Path("~/tmp/csrgraph_data").expanduser()
 CATEGORIES = ["biolink:Disease", "biolink:Gene", "biolink:SmallMolecule"]
 
 
-def timed(label: str, fn):
-    t0 = time.perf_counter()
-    out = fn()
-    dt = time.perf_counter() - t0
+def timed(label: str, fn, reps: int = 3):
+    """Run *fn* once to warm, then report the median of *reps* timed runs."""
+    fn()
+    lat = []
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        out = fn()
+        lat.append(time.perf_counter() - t0)
+    lat.sort()
+    dt = lat[len(lat) // 2]
     n = len(out) if hasattr(out, "__len__") else out
     print(f"    {label:<34} {dt:7.3f}s  -> {n:,}" if isinstance(n, int)
           else f"    {label:<34} {dt:7.3f}s")
@@ -68,6 +74,14 @@ def main():
     g = CSRGraph.load(str(snapshot))
     print(f"graph: {g.num_nodes:,} nodes, {g.csr_merged.nnz:,} edges, "
           f"{len(g.csr_by_relation)} relations")
+
+    # Prime both backends and the graph's lazy caches (expansion plan, reach
+    # masks, LMDB page faults) before any timing. Without this the backend that
+    # runs first absorbs the setup cost, which previously made ES look faster on
+    # two queries where it is in fact slower.
+    for _db in (lmdb, es):
+        g.match_path(["MONDO:0005015", None, None], limit=5, db=_db)
+        _db.nodes_by_category("biolink:Disease", limit=5)
 
     start = pick_start(g)
     deg = int(g.csr_merged.indptr[g.node_to_id[start] + 1]
@@ -164,6 +178,26 @@ def main():
                              return_stats=True)
         print(f"    {label}: truncated={st.truncated} hops={st.truncated_hops} "
               f"frontiers={st.frontier_sizes}")
+
+    # ---- 8. extra_filters parity (mapped, analyzed, and unmapped fields) ---
+    print("\n8. extra_filters parity")
+    dis = lmdb.nodes_by_category("biolink:Disease", limit=400)
+    ic = next(
+        (str(lmdb.get_node(i)["information_content"])
+         for i in dis if "information_content" in lmdb.get_node(i)),
+        None,
+    )
+    nm = lmdb.get_node(dis[0]).get("name")
+    checks = [("id (keyword, pushed down)", {"id": dis[0]})]
+    if nm:
+        checks.append(("name (text, must run client-side)", {"name": nm}))
+    if ic:
+        checks.append(("information_content (unmapped)", {"information_content": ic}))
+    for name, filt in checks:
+        l_ids = sorted(n["id"] for n in lmdb.filter_nodes(dis, extra_filters=filt))
+        e_ids = sorted(n["id"] for n in es.filter_nodes(dis, extra_filters=filt))
+        print(f"    lmdb {len(l_ids):>4} vs es {len(e_ids):>4}   {name}")
+        compare(f"extra_filters({name})", l_ids, e_ids)
 
     print("\n" + "=" * 62)
     if failures:
