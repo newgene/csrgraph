@@ -232,8 +232,7 @@ def query(
         A TRAPI ``Message`` dict with ``query_graph``, ``knowledge_graph``,
         and ``results``.
     """
-    qnodes: dict[str, dict] = query_graph["nodes"]
-    qedges: dict[str, dict] = query_graph["edges"]
+    qnodes, qedges = _validate_query_graph(query_graph)
 
     # Check if any edge uses symmetric predicates (needs bidirectional search).
     has_symmetric = any(
@@ -352,6 +351,45 @@ def _linear_query(
                 break
 
     return bindings
+
+
+def _validate_query_graph(query_graph: dict) -> tuple[dict, dict]:
+    """Check a QueryGraph's shape and return ``(nodes, edges)``.
+
+    Without this, structurally invalid input surfaced as whatever internal
+    ``KeyError`` happened to fire first — an edge naming a nonexistent node came
+    out as ``KeyError: 'n_missing'`` from deep inside linearisation. Raising
+    :class:`ValueError` here gives callers a usable message, and
+    ``trapi_server`` already turns that into a 400.
+    """
+    if not isinstance(query_graph, dict):
+        raise ValueError("query_graph must be an object")
+
+    nodes = query_graph.get("nodes")
+    edges = query_graph.get("edges")
+    if not isinstance(nodes, dict):
+        raise ValueError("query_graph.nodes must be an object")
+    if not isinstance(edges, dict):
+        # Pathfinder-style graphs carry `paths` instead of `edges`; say so
+        # rather than reporting a missing key.
+        if "paths" in query_graph:
+            raise ValueError(
+                "query_graph uses 'paths' (Pathfinder); only 'edges' is supported"
+            )
+        raise ValueError("query_graph.edges must be an object")
+
+    for ek, qe in edges.items():
+        if not isinstance(qe, dict):
+            raise ValueError(f"edge {ek!r} must be an object")
+        for end in ("subject", "object"):
+            ref = qe.get(end)
+            if ref is None:
+                raise ValueError(f"edge {ek!r} is missing {end!r}")
+            if ref not in nodes:
+                raise ValueError(
+                    f"edge {ek!r} {end} {ref!r} is not a node in the query graph"
+                )
+    return nodes, edges
 
 
 def _linearise(

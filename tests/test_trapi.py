@@ -147,6 +147,95 @@ class TestLinearise:
             _linearise(qnodes, qedges)
 
 
+class TestEdgeOrientation:
+    """Queries anchored at the edge's object end must still find answers.
+
+    "What chemicals treat disease X?" pins the object and leaves the subject open.
+    That shape silently returned zero results for every query until the per-hop
+    traversal direction was carried through to match_path, so it is guarded here
+    directly rather than only via the corpus (which needs a real graph).
+    """
+
+    def test_open_subject_pinned_object_finds_answers(self, simple_graph):
+        from trapi import query
+
+        # simple_graph has CHEBI:1 -[affects]-> HGNC:1, so ask it backwards.
+        qg = {
+            "nodes": {
+                "n0": {"categories": ["biolink:SmallMolecule"]},   # open subject
+                "n1": {"ids": ["HGNC:1"]},                          # pinned object
+            },
+            "edges": {"e0": {"subject": "n0", "object": "n1",
+                             "predicates": ["biolink:affects"]}},
+        }
+        msg = query(simple_graph, qg)
+        assert msg["results"], "object-anchored query must not return empty"
+
+        for r in msg["results"]:
+            assert r["node_bindings"]["n1"][0]["id"] == "HGNC:1"
+            assert r["node_bindings"]["n0"][0]["id"].startswith("CHEBI:")
+
+        # Knowledge-graph edges must keep true orientation, not the walk order.
+        for edge in msg["knowledge_graph"]["edges"].values():
+            assert edge["subject"].startswith("CHEBI:")
+            assert edge["object"] == "HGNC:1"
+
+    def test_both_orientations_agree_on_the_same_edge(self, simple_graph):
+        """Forward and reverse anchoring of one edge must both find it."""
+        from trapi import query
+
+        fwd = query(simple_graph, {
+            "nodes": {"n0": {"ids": ["CHEBI:1"]}, "n1": {"ids": ["HGNC:1"]}},
+            "edges": {"e0": {"subject": "n0", "object": "n1",
+                             "predicates": ["biolink:affects"]}},
+        })
+        rev = query(simple_graph, {
+            "nodes": {"n0": {"categories": ["biolink:SmallMolecule"]},
+                      "n1": {"ids": ["HGNC:1"]}},
+            "edges": {"e0": {"subject": "n0", "object": "n1",
+                             "predicates": ["biolink:affects"]}},
+        })
+        assert fwd["results"], "both-pinned should find the edge"
+        pairs_fwd = {(e["subject"], e["object"])
+                     for e in fwd["knowledge_graph"]["edges"].values()}
+        pairs_rev = {(e["subject"], e["object"])
+                     for e in rev["knowledge_graph"]["edges"].values()}
+        assert pairs_fwd <= pairs_rev
+
+
+class TestQueryGraphValidation:
+    """Structurally invalid query graphs must raise ValueError, not KeyError."""
+
+    def test_edge_referencing_missing_node(self, simple_graph):
+        from trapi import query
+
+        qg = {"nodes": {"n0": {"ids": ["CHEBI:1"]}},
+              "edges": {"e0": {"subject": "n0", "object": "n_missing"}}}
+        with pytest.raises(ValueError, match="not a node in the query graph"):
+            query(simple_graph, qg)
+
+    def test_edge_missing_an_end(self, simple_graph):
+        from trapi import query
+
+        qg = {"nodes": {"n0": {}}, "edges": {"e0": {"subject": "n0"}}}
+        with pytest.raises(ValueError, match="missing 'object'"):
+            query(simple_graph, qg)
+
+    def test_pathfinder_paths_graph_is_reported_clearly(self, simple_graph):
+        from trapi import query
+
+        qg = {"nodes": {"n0": {"ids": ["CHEBI:1"]}, "n1": {"ids": ["HGNC:1"]}},
+              "paths": {"p0": {"subject": "n0", "object": "n1"}}}
+        with pytest.raises(ValueError, match="Pathfinder"):
+            query(simple_graph, qg)
+
+    def test_missing_nodes_key(self, simple_graph):
+        from trapi import query
+
+        with pytest.raises(ValueError, match="nodes must be an object"):
+            query(simple_graph, {"edges": {}})
+
+
 class TestOneHopQuery:
     """One-hop TRAPI queries."""
 
