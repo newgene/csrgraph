@@ -172,3 +172,137 @@ Every other row is confounded and should not be read as a speed comparison:
 3. **Validate query graphs before execution** so malformed input yields a TRAPI
    error rather than `KeyError`.
 4. Qualifier descendant expansion, to close the MVP2 subset gap.
+
+---
+
+# Re-run after qualifier-variant keying — 2026-08-13
+
+Same graph data (`2026-07-19`), same gandalf results file. Both metadata stores
+were rebuilt with edge metadata keyed on
+`(subject, predicate, object, qualifier_fingerprint)`.
+
+## Stores rebuilt and verified
+
+`probes/verify_variants.py` counts the source `edges.jsonl` independently of
+either store:
+
+| | |
+| --- | --- |
+| raw edge records | 28,925,258 |
+| distinct `(s, p, o)` | 28,105,517 |
+| distinct `(s, p, o, fingerprint)` | **28,860,305** |
+| assertions the old key dropped | **754,788** |
+| records still collapsed (indistinguishable qualifiers) | 64,953 |
+
+LMDB reports 28,860,305 entries and Elasticsearch 28,860,305 docs — three
+independent counts agreeing exactly. Build cost: LMDB 3,119 s / 24 GB,
+ES 1,240 s / 4 GB primary at 3 shards + 1 replica.
+
+Variants per triple: **98.18%** have exactly one, mean **1.0269**, maximum
+**128**. Earlier notes in this session said "max 14, 99.20% single-variant";
+those figures were wrong, and the correction mattered — see below.
+
+## Two ES defects the rebuild exposed
+
+1. **`get_edge_variants` was bounded by `max_edges_per_pair` (default 100).**
+   `CHEBI:33216 -affects-> GO:0008283` has 103 variants, so ES returned 100 where
+   LMDB returned 103 — dropped answers on the qualifier path, and a divergence
+   between the two supported backends. Now bounded by the result window instead,
+   and it warns rather than truncating silently. This is a single-triple point
+   lookup, so unlike `filter_edges` the bound costs nothing to raise.
+
+2. **The wildcard-predicate branch of `filter_edges` shared one `size` budget**
+   across every pair in a `should` query, so ES returned the globally top-N hits
+   and one dense pair could crowd others out entirely — dropping whole predicates.
+   Pre-existing, amplified ~100× by variant keying. Now an msearch with a per-pair
+   `size`, for the same number of round-trips as the known-predicate branch.
+
+## Ablation: what each change actually contributes
+
+Same store, same code, `--no-variants` truncating retrieval to one edge per
+triple. Answer counts:
+
+| qtype | −var −exp | +var −exp | −var +exp | +var +exp |
+| --- | --- | --- | --- | --- |
+| `mvp2_chem_affects_gene` | 92 | 119 | 92 | **137** |
+| `mvp2_chem_affects_open_gene` | 102 | 128 | 102 | **135** |
+| all eight others | unchanged | unchanged | unchanged | unchanged |
+
+Variant keying contributes **+45 / +33** and the Biolink expander **+18 / +7**,
+on exactly the two qualifier-constrained queries and nothing else — the predicted
+mechanism, with no side effects elsewhere.
+
+Comparing against the previously saved `/tmp/tc_csr.json` would *not* have
+isolated this: that run predates commit `30fa74e` (subclass expansion on by
+default), so its deltas conflate three changes. The pre-variant LMDB store cannot
+be read by the current code either — its 3-component keys don't match the
+4-component prefix — which is why the ablation patches retrieval instead.
+
+## The dominant cause was neither: constraints are applied after the cap
+
+`limit` does not mean "return up to N answers". `match_path` enumerates N paths
+and qualifier/attribute constraints are filtered *afterwards*, so a constrained
+query returns "however many of the first N survive". Sweeping the limit on
+`mvp2_chem_affects_gene`:
+
+| limit | 200 | 1,000 | 5,000 | 20,000 |
+| --- | --- | --- | --- | --- |
+| results | 137 | 713 | **979** | 979 |
+
+At `limit >= 5000` csrgraph returns **979**, and `mvp2_chem_affects_open_gene`
+returns **804** — both *exactly* gandalf's answer sets, set-equal with zero
+difference in either direction. To its credit `match_path` does emit its
+truncation warning here, so the shortfall was reported rather than silent.
+
+This is the same defect class as the multi-predicate bug fixed earlier
+(filter-after-cap). It is the strongest argument for raising the default `limit`,
+and better, for pushing constraints into enumeration.
+
+## Final comparison, uncapped and expanded
+
+`--expander --limit 100000` against unchanged gandalf results:
+
+| qtype | csrgraph | gandalf | accuracy |
+| --- | --- | --- | --- |
+| `one_hop_lookup_pinned` | 0.2 ms, 1 | 420 ms, 1 | **IDENTICAL** |
+| `one_hop_lookup_open` | 7.2 ms, 141 | 523 ms, 140 | csr superset (n1) |
+| `one_hop_no_predicate` | 219 ms, 4,262 | 755 ms, 2,957 | csr superset (n1) |
+| `two_hop_lookup` | 28,045 ms, 62,536 | 3,461 ms, 62,536 | **IDENTICAL** |
+| `batch_lookup` | 33.6 ms, 659 | 542 ms, 548 | csr superset (n1) |
+| `mvp1_heavy` | 2.9 ms, 71 | 519 ms, 70 | csr superset (n1) |
+| `mvp1_medium` | 7.6 ms, 141 | 510 ms, 140 | csr superset (n1) |
+| `mvp1_light` | 3.2 ms, 64 | 483 ms, 49 | csr superset (n1) |
+| `mvp2_chem_affects_gene` | 90.6 ms, 979 | 480 ms, 979 | **IDENTICAL** |
+| `mvp2_chem_affects_open_gene` | 63.3 ms, 804 | 515 ms, 804 | **IDENTICAL** |
+
+Four exactly identical, and **every remaining difference is now a single cause**:
+csrgraph binds subclass *descendants* to a pinned query node without TRAPI's
+`query_id`. Asked for `MONDO:0005148` it also binds `MONDO:0011072`, emitting
+`{"id": "MONDO:0011072", "attributes": []}`. gandalf binds only the queried CURIE.
+TRAPI has `NodeBinding.query_id` for precisely this case; without it a downstream
+ARA cannot tell the bound node was returned as a descendant of what it asked for,
+and strictly the result does not satisfy the query graph as written. csrgraph's
+answers are richer but non-conformant, and this is the one remaining item.
+
+`two_hop_lookup` at 28 s against gandalf's 3.5 s is the one place gandalf is
+clearly faster on equal output (62,536 results both). Its vectorized 3-hop
+bidirectional search is built for exactly this shape.
+
+## Backend parity
+
+Same config (expander, `limit=200`), LMDB vs Elasticsearch: **identical answer
+sets on 9 of the 10 answering queries**. The one exception is `two_hop_lookup`,
+where both return exactly 200 — *which* 200 depends on backend edge ordering, so
+it is a truncation artifact rather than disagreement. LMDB is 20–80× faster
+throughout (e.g. `mvp2_chem_affects_gene` 14 ms vs 1,146 ms), consistent with the
+earlier backend benchmarks.
+
+## Remaining work
+
+1. **Emit `query_id` on subclass-expanded node bindings.** Sole cause of every
+   remaining corpus difference.
+2. **Push constraints into enumeration, or raise the default `limit`.** The
+   filter-after-cap behaviour silently under-answers constrained queries.
+3. Surface truncation in TRAPI `message.logs` (it currently only warns).
+4. Split 400 vs 500 in `trapi_server.py`; put the corpus in CI behind a
+   data-gated skip.

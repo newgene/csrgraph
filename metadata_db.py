@@ -76,13 +76,23 @@ def qualifier_fingerprint(edge_meta: dict) -> str:
     * **Content-derived, not positional.** The value depends only on the qualifiers,
       so it is identical across rebuilds regardless of input order — which an
       ordinal variant index would not be.
-    * **Empty for unqualified edges.** ~99% of triples carry a single variant and
-      most carry no qualifiers at all, so those keep a one-byte suffix instead of a
-      hash, keeping the key overhead negligible.
+    * **Empty for unqualified edges.** Most triples carry a single variant and no
+      qualifiers at all, so those keep a one-byte suffix instead of a hash,
+      keeping the key overhead negligible.
 
-    Measured on the 2026-07-19 archive, every duplicated triple differed in its
-    qualifiers (and none differed only elsewhere), so the qualifier set alone is a
-    sufficient discriminator.
+    Measured on the 2026-07-19 archive (``probes/verify_variants.py``):
+
+    ==========================================  ==============
+    raw edge records                             28,925,258
+    distinct ``(s, p, o)``                       28,105,517
+    distinct ``(s, p, o, fingerprint)``          28,860,305
+    ==========================================  ==============
+
+    So keying on the triple alone was dropping **754,788 assertions**, and the
+    qualifier set recovers all but 64,953 of the duplicate records — those remain
+    collapsed because they are indistinguishable in their qualifiers.  Variants
+    per triple: 98.18% have exactly one, the mean is 1.0269, and the maximum is
+    **128**, which is the number any per-triple fetch bound has to clear.
     """
     quals = {k: v for k, v in edge_meta.items() if "qualifier" in k}
     if not quals:
@@ -2101,6 +2111,17 @@ class ElasticsearchMetadataBackend(MetadataBackend):
         Retrieval is by term query on subject/predicate/object, so it already
         returns every stored document for the triple; only the write-time ``_id``
         needed the fingerprint to stop variants overwriting one another.
+
+        Deliberately **not** bounded by ``max_edges_per_pair``.  That constant
+        sizes the bulk :meth:`filter_edges` path, where it trades against msearch
+        batch size, and its default of 100 truncated real triples here:
+        ``CHEBI:33216 -affects-> GO:0008283`` carries 103 variants in the
+        2026-07-19 graph, so ES returned 100 where LMDB returned all 103 — both a
+        dropped-answer bug on qualifier constraints and a divergence between the
+        two backends.  This is a single-triple point lookup, one request either
+        way, so it uses the result window instead: a triple with more variants
+        than that is implausible (the observed maximum is ~10^2), and if one ever
+        appears the count is reported rather than silently dropped.
         """
         resp = self._es.search(
             index=self._edges_idx,
@@ -2109,9 +2130,20 @@ class ElasticsearchMetadataBackend(MetadataBackend):
                 {"term": {"predicate": _strip_biolink(predicate)}},
                 {"term": {"object": obj}},
             ]}},
-            size=self._max_edges_per_pair,
+            size=self._ES_MAX_RESULT_WINDOW,
+            track_total_hits=True,
         )
-        return [self._normalise_edge(h["_source"]) for h in resp["hits"]["hits"]]
+        hits = resp["hits"]["hits"]
+        total = resp["hits"]["total"]["value"]
+        if total > len(hits):
+            warnings.warn(
+                f"{subject} -{predicate}-> {obj} has {total:,} stored variants; "
+                f"returning the first {len(hits):,} (index.max_result_window). "
+                "Qualifier constraints on this edge may miss answers.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return [self._normalise_edge(h["_source"]) for h in hits]
 
     def get_edge(self, subject: str, predicate: str, obj: str) -> dict:
         from elasticsearch import NotFoundError  # type: ignore[import]
@@ -2264,16 +2296,21 @@ class ElasticsearchMetadataBackend(MetadataBackend):
                     for hit in r.get("hits", {}).get("hits", []):
                         results.append(self._normalise_edge(hit["_source"]))
 
-        # ── Wildcard-predicate edges: bool/should search ─────────────────────
-        # Batched in chunks so that neither the ``should`` clause count nor
-        # ``size`` exceeds ``_ES_MAX_RESULT_WINDOW``.
+        # ── Wildcard-predicate edges: msearch, one sub-query per pair ─────────
+        # This used to be a single bool/should query per chunk with
+        # ``size = len(batch) * per_pair``.  That budget is *shared*: ES returns
+        # the globally top-scoring hits, so one dense pair could consume it and
+        # crowd other pairs of the same chunk out entirely — dropping whole
+        # predicates rather than surplus variants of one.  Qualifier-variant
+        # keying made that acute, since a pair like
+        # ``CHEBI:33216 / GO:0008283`` now stores 103 documents where it
+        # previously stored one.  An msearch gives each pair its own ``size``,
+        # for the same number of HTTP round-trips as the known-predicate branch.
         if no_pred:
-            # Each (subject, object) pair may yield up to per_pair edges, so we
-            # limit chunks so that chunk_len * per_pair <= _ES_MAX_RESULT_WINDOW.
-            _SHOULD_CHUNK = max(1, self._ES_MAX_RESULT_WINDOW // per_pair)
-            for batch_start in range(0, len(no_pred), _SHOULD_CHUNK):
-                batch = no_pred[batch_start : batch_start + _SHOULD_CHUNK]
-                should: list[dict] = []
+            _MSEARCH_BATCH_NP = max(1, self._ES_MAX_RESULT_WINDOW // per_pair)
+            for batch_start in range(0, len(no_pred), _MSEARCH_BATCH_NP):
+                batch = no_pred[batch_start : batch_start + _MSEARCH_BATCH_NP]
+                searches_np: list[dict] = []
                 for s, o in batch:
                     must_np: list[dict] = [
                         {"term": {"subject": s}},
@@ -2285,14 +2322,14 @@ class ElasticsearchMetadataBackend(MetadataBackend):
                         must_np.append({"term": {"agent_type": agent_type}})
                     for k, v in pushdown.items():
                         must_np.append({"term": {k: str(v)}})
-                    should.append({"bool": {"must": must_np}})
-                resp = self._es.search(
-                    index=self._edges_idx,
-                    query={"bool": {"should": should, "minimum_should_match": 1}},
-                    size=min(len(batch) * per_pair, self._ES_MAX_RESULT_WINDOW),
-                )
-                for hit in resp["hits"]["hits"]:
-                    results.append(self._normalise_edge(hit["_source"]))
+                    searches_np.append({"index": self._edges_idx})
+                    searches_np.append(
+                        {"query": {"bool": {"must": must_np}}, "size": per_pair}
+                    )
+                resp = self._es.msearch(searches=searches_np)
+                for r in resp["responses"]:
+                    for hit in r.get("hits", {}).get("hits", []):
+                        results.append(self._normalise_edge(hit["_source"]))
 
         return self._apply_py_filters(results, py_filters)
 
