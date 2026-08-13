@@ -1171,12 +1171,16 @@ def _apply_edge_attribute_constraints(
                 keep = False
                 break
             subj, pred, obj = edge
-            edge_meta = db.get_edge(subj, pred, obj)
-            for ac in constraints:
-                if not _eval_constraint(edge_meta, ac):
-                    keep = False
-                    break
-            if not keep:
+            # The same triple can be stored several times with different
+            # qualifiers/attributes; the constraint is met if *any* of those
+            # variants meets it.  Reading a single record silently dropped
+            # answers whose matching variant was not the one kept.
+            variants = db.get_edge_variants(subj, pred, obj) or [{}]
+            if not any(
+                all(_eval_constraint(v, ac) for ac in constraints)
+                for v in variants
+            ):
+                keep = False
                 break
         if keep:
             filtered.append(binding)
@@ -1215,8 +1219,10 @@ def _apply_qualifier_filters(
                 keep = False
                 break
             subj, pred, obj = edge
-            edge_meta = db.get_edge(subj, pred, obj)
-            if not _matches_any_qualifier_set(edge_meta, qualifier_sets):
+            variants = db.get_edge_variants(subj, pred, obj) or [{}]
+            if not any(
+                _matches_any_qualifier_set(v, qualifier_sets) for v in variants
+            ):
                 keep = False
                 break
         if keep:
