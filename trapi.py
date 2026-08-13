@@ -54,10 +54,14 @@ Usage::
 
 from __future__ import annotations
 
+import logging
 import re
+from datetime import datetime, timezone
 from typing import Iterable, Any
 
 from csrgraph_kgx import CSRGraph, _strip_biolink
+
+logger = logging.getLogger(__name__)
 
 # Type alias for a complete binding of a query graph to concrete nodes/edges.
 # nodes: qnode_key → CURIE,  edges: qedge_key → (subject, predicate, object)
@@ -270,19 +274,19 @@ def query(
     # Fast path: try to linearise into a chain for match_path().
     # Falls back to general matcher for non-linear or symmetric queries.
     if has_symmetric:
-        bindings = _general_match(graph, qnodes, qedges, limit)
+        bindings, truncated = _general_match(graph, qnodes, qedges, limit)
     else:
         try:
             ordered_node_keys, ordered_edge_keys, hop_dirs = _linearise(
                 qnodes, qedges
             )
-            bindings = _linear_query(
+            bindings, truncated = _linear_query(
                 graph, qnodes, qedges, ordered_node_keys, ordered_edge_keys, limit,
                 hop_dirs, node_subclassing, subclass_depth,
             )
         except ValueError:
             # Branching or cyclic — use the general subgraph matcher.
-            bindings = _general_match(graph, qnodes, qedges, limit)
+            bindings, truncated = _general_match(graph, qnodes, qedges, limit)
 
     # Post-filter pipeline: subclass validation → node constraints →
     # edge attributes → qualifiers.
@@ -293,7 +297,9 @@ def query(
     bindings = _apply_edge_attribute_constraints(graph, bindings, qedges)
     bindings = _apply_qualifier_filters(graph, bindings, qedges)
 
-    return _build_message(graph, query_graph, bindings, query_ids)
+    return _build_message(
+        graph, query_graph, bindings, query_ids, truncated=truncated, limit=limit
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -310,11 +316,15 @@ def _linear_query(
     hop_directions: list[bool] | None = None,
     node_subclassing: bool = False,
     subclass_depth: int | None = None,
-) -> list[Binding]:
+) -> tuple[list[Binding], bool]:
     """Execute a linear-chain query via match_path and convert to bindings.
 
     Handles multiple IDs on the start node (BATCH expansion) and multiple
     predicates per edge (wildcard + post-filter).
+
+    Returns ``(bindings, truncated)``.  ``match_path`` already computes whether a
+    hop hit its cap; this forwards it so the caller can say so in the response
+    rather than presenting a subset as if it were the whole answer.
     """
     # Determine which start IDs to iterate over (BATCH expansion).
     start_nk = ordered_node_keys[0]
@@ -336,9 +346,12 @@ def _linear_query(
             symmetric_edges[hop_idx] = True
 
     bindings: list[Binding] = []
+    truncated = False
 
     for start_id in start_ids:
         if len(bindings) >= limit:
+            # Start IDs left unprocessed, so some batch members never ran.
+            truncated = True
             break
 
         # Build path_spec, substituting the start ID for this iteration.
@@ -347,10 +360,12 @@ def _linear_query(
             start_id_override=start_id,
         )
         remaining = limit - len(bindings)
-        raw_paths = graph.match_path(
+        raw_paths, stats = graph.match_path(
             path_spec, limit=remaining, hop_directions=hop_directions,
             node_subclassing=node_subclassing, subclass_depth=subclass_depth,
+            return_stats=True,
         )
+        truncated = truncated or stats.truncated
 
         for path in raw_paths:
             nodes: dict[str, str] = {}
@@ -384,7 +399,7 @@ def _linear_query(
             if len(bindings) >= limit:
                 break
 
-    return bindings
+    return bindings, truncated
 
 
 class BiolinkExpander:
@@ -654,8 +669,12 @@ def _general_match(
     qnodes: dict[str, dict],
     qedges: dict[str, dict],
     limit: int,
-) -> list[Binding]:
+) -> tuple[list[Binding], bool]:
     """Find all subgraph bindings matching an arbitrary query graph pattern.
+
+    Returns ``(bindings, truncated)``; *truncated* is True when the search
+    stopped because *limit* was reached, so a caller can tell an exhaustive
+    answer from a partial one.
 
     Uses backtracking search:
     1. Pick the most constrained unbound QNode adjacent to a bound QNode.
@@ -682,9 +701,13 @@ def _general_match(
     start_key = min(qnodes, key=_start_score)
     start_candidates = _get_candidates(graph, db, qnodes[start_key])
     if not start_candidates:
-        return []
+        return [], False
 
     results: list[Binding] = []
+    # Set when the search stops because *limit* was reached, so the caller can
+    # tell a complete answer from a truncated one.  match_path reports the same
+    # thing via MatchStats; this matcher previously reported nothing at all.
+    truncated = False
 
     def _backtrack(
         node_bindings: dict[str, str],
@@ -764,10 +787,26 @@ def _general_match(
                 return
 
         # Filter candidates by QNode constraints.
-        candidates = _filter_by_qnode(graph, db, qnodes[next_key], list(candidates))
+        #
+        # ``sorted``, not ``list``: *candidates* is a set of CURIE **strings**,
+        # and Python randomises ``str.__hash__`` per process, so ``list(...)``
+        # yields a different order on every run.  That order decides which
+        # candidates are explored before ``len(results) >= limit`` stops the
+        # search, so an identical query returned different answers run to run —
+        # measured on the HelmsDeep ``two_hop_lookup`` as three different genes
+        # across three runs, and stable under ``PYTHONHASHSEED=0``.
+        #
+        # ``match_path`` never had this problem because it works in CSR index
+        # space, where the sets hold ``int`` node indices and ``int.__hash__``
+        # is identity.  Sorting by CURIE rather than node index is deliberate:
+        # index order depends on KGX ingest order, so it would not survive a
+        # graph rebuild, whereas CURIEs do.
+        candidates = _filter_by_qnode(graph, db, qnodes[next_key], sorted(candidates))
 
         for curie in candidates:
             if len(results) >= limit:
+                nonlocal truncated
+                truncated = True
                 return
             # Bind this node and all connecting edges.
             node_bindings[next_key] = curie
@@ -797,10 +836,18 @@ def _general_match(
     # Launch search from each start candidate.
     for curie in start_candidates:
         if len(results) >= limit:
+            # Start candidates left unexplored: the answer is a subset.
+            truncated = True
             break
         _backtrack({start_key: curie}, {})
 
-    return results
+    if truncated:
+        logger.warning(
+            "_general_match stopped at limit=%d: returning %d binding(s), which "
+            "is a subset of the matches. Raise limit= for a complete result.",
+            limit, len(results),
+        )
+    return results, truncated
 
 
 def _get_candidates(
@@ -942,7 +989,11 @@ def _matching_predicates(
     if has_symmetric:
         reverse_preds = graph.edges_between(target, source)
         # Combine, marking reverse preds (they still match for symmetric).
-        actual_preds = list(set(actual_preds) | set(reverse_preds))
+        # Sorted for the same reason as the candidate set: callers take
+        # ``preds[0]`` as *the* predicate for the edge binding, so iterating a
+        # string set here made which predicate got reported vary between runs
+        # even when nothing was truncated.
+        actual_preds = sorted(set(actual_preds) | set(reverse_preds))
 
     if not actual_preds:
         return []
@@ -1341,8 +1392,18 @@ def _build_message(
     query_graph: dict,
     bindings: list[Binding],
     query_ids: dict[str, dict[str, str]] | None = None,
+    *,
+    truncated: bool = False,
+    limit: int | None = None,
 ) -> dict:
-    """Assemble a TRAPI Message from bindings."""
+    """Assemble a TRAPI Message from bindings.
+
+    When *truncated*, a ``message.logs`` entry records that the result set is a
+    subset.  A client cannot otherwise distinguish "these are all the answers"
+    from "these are the first *limit* of them", and the two mean very different
+    things: with constraints applied after the cap, a constrained query can
+    return far fewer answers than exist.
+    """
     db = graph.db
     kg_nodes: dict[str, dict] = {}
     kg_edges: dict[str, dict] = {}
@@ -1386,7 +1447,7 @@ def _build_message(
             }],
         })
 
-    return {
+    message: dict[str, Any] = {
         "query_graph": query_graph,
         "knowledge_graph": {
             "nodes": kg_nodes,
@@ -1394,6 +1455,18 @@ def _build_message(
         },
         "results": results,
     }
+    if truncated:
+        message["logs"] = [{
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": "WARNING",
+            "code": "ResultsTruncated",
+            "message": (
+                f"Result set is incomplete: enumeration stopped at limit="
+                f"{limit}, returning {len(results)} result(s). Raise the limit "
+                f"for a complete answer."
+            ),
+        }]
+    return message
 
 
 def _make_kg_node(db: Any, curie: str) -> dict:

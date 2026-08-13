@@ -402,3 +402,90 @@ The one genuine correctness item still open is backend-dependent truncation:
 keep different subsets (disjoint on `two_hop_lookup`'s `n1`). Both subsets are
 provably inside the uncapped answer set, so neither is wrong, but the same query
 should not depend on the configured backend.
+
+---
+
+## Truncation was nondeterministic, not backend-dependent — fixed 2026-08-13
+
+The LMDB/ES divergence on `two_hop_lookup` was misdiagnosed. Three tests:
+
+| Test | Result |
+| --- | --- |
+| LMDB vs ES at `limit=3000` | **identical** — same 2,404 `n0`, same 7 `n1` |
+| LMDB alone, three separate runs at `limit=200` | **three different answers** (`NCBIGene:4137` / `:2` / `:1509`) |
+| Same, with `PYTHONHASHSEED=0` | identical every run |
+
+The backends never disagreed. They differed only because they ran in **separate
+processes**. The real defect was that a truncated result depended on the process's
+hash seed, so the same query could answer differently on consecutive calls.
+
+### Root cause
+
+`two_hop_lookup` queries `biolink:associated_with`, which is symmetric, so it
+routes to `_general_match`, **not** `match_path` (verified deterministic: identical
+200 paths across seeds). Two sites in the general matcher iterated sets of CURIE
+**strings**, and Python randomises `str.__hash__` per process:
+
+* `_general_match` collected candidates into a `set[str]` and passed
+  `list(candidates)` to the constraint filter. That order decides which candidates
+  are explored before `len(results) >= limit` halts the search.
+* `_matching_predicates` built `list(set(actual_preds) | set(reverse_preds))` for
+  symmetric edges, and callers take `preds[0]` as *the* predicate — so which
+  predicate got reported varied between runs even with no truncation at all.
+
+`match_path` escaped because it works in CSR index space, where the sets hold
+`int` node indices and `int.__hash__` is identity. Every other set in these
+modules is a membership test whose order never escapes.
+
+Sorting by **CURIE** rather than node index is deliberate: index order depends on
+KGX ingest order and would not survive a graph rebuild.
+
+### gandalf, for comparison
+
+Measured deterministic across three hash seeds (identical set *and* ordering). It
+does **not** sort candidates — its `sorted()` calls canonicalise *keys*
+(`tuple(sorted(key_pairs))` for grouping, `tuple(sorted(...))` over qualifiers and
+sources for a stable edge key — the same trick as our `qualifier_fingerprint`).
+It avoids the failure mode structurally: the search runs on integer node indices in
+numpy arrays, and where it truncates it slices a numpy array
+(`path_finder.py:120`). Note it did not truncate this query at all, returning all
+62,536, so it sidesteps the question rather than answering it differently.
+
+So sorting is a correct minimal fix, not parity with gandalf. The durable fix is
+gandalf's: keep `_general_match` in index space. That is a rewrite of the general
+matcher, worth doing only if symmetric-predicate queries matter enough — 1 of 12
+corpus queries today, though 39 Biolink predicates are symmetric.
+
+### Truncation is now reported
+
+`_general_match` previously signalled nothing when it hit the cap, and neither
+matcher surfaced it in the response. Both now return `(bindings, truncated)`, and
+a capped result carries a `message.logs` entry:
+
+```json
+{"level": "WARNING", "code": "ResultsTruncated",
+ "message": "Result set is incomplete: enumeration stopped at limit=200,
+             returning 200 result(s). Raise the limit for a complete answer."}
+```
+
+This matters more than it looks: because constraints are applied *after* the cap,
+a constrained query can return far fewer answers than exist, and previously
+nothing in the response said so.
+
+### Verified
+
+* Three runs on the real graph now return identical `n1`
+  (`['NCBIGene:10347', 'NCBIGene:1471']`) and report `ResultsTruncated`.
+* **LMDB and ES now agree at `limit=200`** — `n0` 179 both, same `n1`. Original
+  symptom gone.
+* Uncapped corpus results are unchanged, including `two_hop_lookup` at 62,536
+  identical to gandalf — ordering only matters when truncating.
+* The determinism test fails on the pre-fix code (three different 5-CURIE sets
+  across seeds), so it genuinely guards the behaviour.
+
+### Still open
+
+Determinism makes the arbitrary choice *reproducible*, not *good*: the kept subset
+is now the alphabetically-first CURIEs. Two independent follow-ups remain —
+applying constraints during enumeration so `limit` means "N answers" rather than
+"N paths examined", and ranking before truncating so the kept subset is defensible.

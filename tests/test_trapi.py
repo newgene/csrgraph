@@ -1242,3 +1242,124 @@ class TestSubclassBindingConformance:
         bindings = [b for r in msg["results"] for b in r["node_bindings"]["n1"]]
         assert {b["id"] for b in bindings} == {"D:root"}
         assert all("query_id" not in b for b in bindings)
+
+
+# ---------------------------------------------------------------------------
+# Determinism under truncation
+# ---------------------------------------------------------------------------
+
+_DETERMINISM_SCRIPT = """
+import sys
+sys.path.insert(0, %r)
+from csrgraph_kgx import CSRGraph
+from metadata_db import MetadataBackend
+import trapi
+
+
+class _DB(MetadataBackend):
+    def get_node(self, nid):
+        return {"id": nid, "category": ["biolink:ChemicalEntity"]}
+
+    def get_edge(self, s, p, o):
+        return {"subject": s, "predicate": p, "object": o}
+
+    def filter_nodes(self, node_ids, *, category=None, extra_filters=None):
+        return [self.get_node(n) for n in node_ids]
+
+    def filter_edges(self, edges, *, knowledge_level=None, agent_type=None,
+                     extra_filters=None):
+        return [{"subject": s, "predicate": p, "object": o} for s, p, o in edges]
+
+    def close(self):
+        pass
+
+
+# 60 candidates behind a *symmetric* predicate, which routes the query to
+# _general_match rather than match_path, with limit=5 so truncation bites.
+triples = [("C:%%02d" %% i, "biolink:associated_with", "D:1") for i in range(60)]
+g = CSRGraph(triples)
+g.set_db(_DB())
+qg = {"nodes": {"n0": {"categories": ["biolink:ChemicalEntity"]},
+                "n1": {"ids": ["D:1"]}},
+      "edges": {"e0": {"subject": "n0", "object": "n1",
+                       "predicates": ["biolink:associated_with"]}}}
+msg = trapi.query(g, qg, limit=5)
+kept = [b["id"] for r in msg["results"] for b in r["node_bindings"]["n0"]]
+print(",".join(kept))
+print("TRUNCATED" if msg.get("logs") else "COMPLETE")
+"""
+
+
+def _run_with_hashseed(seed: str) -> tuple[str, str]:
+    """Run the query in a subprocess with a fixed PYTHONHASHSEED."""
+    import os
+    import subprocess
+
+    root = str(Path(__file__).resolve().parent.parent)
+    env = {**os.environ, "PYTHONHASHSEED": seed}
+    out = subprocess.run(
+        [sys.executable, "-c", _DETERMINISM_SCRIPT % root],
+        capture_output=True, text=True, env=env, check=True,
+    ).stdout.splitlines()
+    return out[0], out[1]
+
+
+class TestTruncationDeterminism:
+    """A truncated result must not depend on the process's hash seed.
+
+    ``_general_match`` collected candidate CURIEs into a ``set[str]`` and
+    iterated it. Python randomises ``str.__hash__`` per process, so the
+    exploration order — and therefore *which* candidates survived the ``limit``
+    — changed on every run. Measured on the real graph, one query returned three
+    different genes across three runs. ``match_path`` was unaffected because it
+    works on ``int`` node indices, whose hash is identity.
+    """
+
+    def test_same_answers_across_hash_seeds(self):
+        first, _ = _run_with_hashseed("1")
+        second, _ = _run_with_hashseed("2")
+        third, _ = _run_with_hashseed("12345")
+        assert first == second == third, (
+            f"truncated result varies with PYTHONHASHSEED: "
+            f"{first} / {second} / {third}"
+        )
+
+    def test_truncation_is_reported_in_logs(self):
+        _, status = _run_with_hashseed("1")
+        assert status == "TRUNCATED", (
+            "a capped result set must say so in message.logs, or a client "
+            "cannot tell a partial answer from a complete one"
+        )
+
+
+class TestTruncationLogs:
+    """message.logs appears only when the answer really is a subset."""
+
+    @pytest.fixture(scope="class")
+    def graph(self):
+        from csrgraph_kgx import CSRGraph
+
+        g = CSRGraph([("C:1", "biolink:treats", "D:1"),
+                      ("C:2", "biolink:treats", "D:1"),
+                      ("C:3", "biolink:treats", "D:1")])
+        g.set_db(_StubDB())
+        return g
+
+    def _msg(self, g, limit):
+        from trapi import query
+
+        qg = {"nodes": {"n0": {}, "n1": {"ids": ["D:1"]}},
+              "edges": {"e0": {"subject": "n0", "object": "n1",
+                               "predicates": ["biolink:treats"]}}}
+        return query(g, qg, limit=limit)
+
+    def test_no_logs_when_complete(self, graph):
+        msg = self._msg(graph, 100)
+        assert len(msg["results"]) == 3
+        assert "logs" not in msg
+
+    def test_logs_when_capped(self, graph):
+        msg = self._msg(graph, 2)
+        assert len(msg["results"]) == 2
+        assert msg["logs"][0]["code"] == "ResultsTruncated"
+        assert msg["logs"][0]["level"] == "WARNING"
