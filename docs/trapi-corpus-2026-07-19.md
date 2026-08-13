@@ -275,14 +275,41 @@ and better, for pushing constraints into enumeration.
 | `mvp2_chem_affects_gene` | 90.6 ms, 979 | 480 ms, 979 | **IDENTICAL** |
 | `mvp2_chem_affects_open_gene` | 63.3 ms, 804 | 515 ms, 804 | **IDENTICAL** |
 
-Four exactly identical, and **every remaining difference is now a single cause**:
-csrgraph binds subclass *descendants* to a pinned query node without TRAPI's
-`query_id`. Asked for `MONDO:0005148` it also binds `MONDO:0011072`, emitting
-`{"id": "MONDO:0011072", "attributes": []}`. gandalf binds only the queried CURIE.
-TRAPI has `NodeBinding.query_id` for precisely this case; without it a downstream
-ARA cannot tell the bound node was returned as a descendant of what it asked for,
-and strictly the result does not satisfy the query graph as written. csrgraph's
-answers are richer but non-conformant, and this is the one remaining item.
+Four exactly identical. Every remaining difference is csrgraph returning **more**
+on the pinned node `n1`, and per-node set arithmetic shows five of the six are a
+strict superset of gandalf:
+
+| qtype | node | csr | gandalf | shared | csr-only | gan-only |
+| --- | --- | --- | --- | --- | --- | --- |
+| `one_hop_lookup_open` | n1 | 2 | 1 | 1 | 1 | 0 |
+| `one_hop_no_predicate` | n1 | 4 | 1 | 1 | 3 | 0 |
+| `batch_lookup` | n1 | 38 | 6 | 5 | 33 | **1** |
+| `mvp1_heavy` | n1 | 2 | 1 | 1 | 1 | 0 |
+| `mvp1_medium` | n1 | 2 | 1 | 1 | 1 | 0 |
+| `mvp1_light` | n1 | 3 | 1 | 1 | 2 | 0 |
+
+Three distinct causes, not one:
+
+1. **No `query_id` on subclass-expanded bindings.** csrgraph binds subclass
+   *descendants* of a pinned node: asked for `MONDO:0005148` it also binds
+   `MONDO:0011072`, emitting `{"id": "MONDO:0011072", "attributes": []}`. gandalf
+   binds only the queried CURIE. TRAPI has `NodeBinding.query_id` for exactly
+   this; without it a downstream ARA cannot tell the bound node came back as a
+   descendant of what it asked for, and strictly the result does not satisfy the
+   query graph as written. This accounts for the bulk of the csr-only counts.
+
+2. **Subclass descendants bypass the queried category.** `batch_lookup` constrains
+   `n1` to `biolink:Disease`, yet csrgraph binds `HP:0000978` ("Easy Bruising"),
+   whose category list does **not** contain `biolink:Disease`. Expanded nodes are
+   not re-checked against the query node's `categories`. This is a plain
+   conformance bug, independent of (1).
+
+3. **The one gandalf-only answer is gandalf over-reporting.** `MONDO:0019293` has
+   194 in-edges but **zero** under `biolink:treats` or either BMT descendant
+   (`ameliorates_condition`, `preventative_for_condition`). What does point at it
+   is `treats_or_applied_or_studied_to_treat` — an *ancestor* of `treats`. A
+   weaker, broader assertion does not entail `treats`, so matching it widens the
+   hierarchy upward. csrgraph is correct to exclude it.
 
 `two_hop_lookup` at 28 s against gandalf's 3.5 s is the one place gandalf is
 clearly faster on equal output (62,536 results both). Its vectorized 3-hop
@@ -299,8 +326,9 @@ earlier backend benchmarks.
 
 ## Remaining work
 
-1. **Emit `query_id` on subclass-expanded node bindings.** Sole cause of every
-   remaining corpus difference.
+1. **Emit `query_id` on subclass-expanded node bindings**, and **re-check expanded
+   nodes against the query node's `categories`** (a Disease query currently returns
+   `HP:` phenotype nodes). Together these account for every csr-only answer.
 2. **Push constraints into enumeration, or raise the default `limit`.** The
    filter-after-cap behaviour silently under-answers constrained queries.
 3. Surface truncation in TRAPI `message.logs` (it currently only warns).
