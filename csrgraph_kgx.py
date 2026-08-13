@@ -1430,29 +1430,39 @@ class CSRGraph:
             )
         return self._subclass_of_T_cache
 
-    def _expand_subclasses(self, node_id: int) -> frozenset[int]:
-        """Return *node_id* plus all descendant IDs reachable via subclass edges.
+    def _expand_subclasses(
+        self,
+        node_id: int,
+        max_depth: Optional[int] = None,
+    ) -> frozenset[int]:
+        """Return *node_id* plus descendant IDs reachable via subclass edges.
 
         BFS on the transposed subclass matrix (parent→children direction), built
         from every predicate in :attr:`SUBCLASS_PREDICATES` present in the
         graph.  Returns a singleton ``{node_id}`` when no subclass edges exist.
+
+        *max_depth* bounds how many subclass hops are followed: ``1`` takes only
+        direct children (what TRAPI engines conventionally do), while ``None``
+        follows the hierarchy transitively.  Depth matters — an ontology chain
+        several levels deep expands to a much larger set transitively, so two
+        engines using different depths give different answers on the same graph.
         """
         T = self._get_subclass_of_T()
-        if T is None:
+        if T is None or max_depth == 0:
             return frozenset({node_id})
-        result: set[int] = set()
-        queue: deque[int] = deque([node_id])
-        while queue:
-            cur = queue.popleft()
-            if cur in result:
+        result: set[int] = {node_id}
+        frontier: deque[tuple[int, int]] = deque([(node_id, 0)])
+        while frontier:
+            cur, depth = frontier.popleft()
+            if max_depth is not None and depth >= max_depth:
                 continue
-            result.add(cur)
             start = int(T.indptr[cur])
             end   = int(T.indptr[cur + 1])
             for j in range(start, end):
                 child = int(T.indices[j])
                 if child not in result:
-                    queue.append(child)
+                    result.add(child)
+                    frontier.append((child, depth + 1))
         return frozenset(result)
 
     # ------------------------------------------------------------------
@@ -1959,6 +1969,7 @@ class CSRGraph:
         db: MetadataBackend | None = ...,
         return_stats: Literal[False] = ...,
         hop_directions: Optional[List[bool]] = ...,
+        subclass_depth: Optional[int] = ...,
     ) -> List[List[PathEdge]]: ...
 
     @overload
@@ -1971,6 +1982,7 @@ class CSRGraph:
         *,
         return_stats: Literal[True],
         hop_directions: Optional[List[bool]] = ...,
+        subclass_depth: Optional[int] = ...,
     ) -> Tuple[List[List[PathEdge]], MatchStats]: ...
 
     def match_path(
@@ -1981,6 +1993,7 @@ class CSRGraph:
         db: MetadataBackend | None = None,
         return_stats: bool = False,
         hop_directions: Optional[List[bool]] = None,
+        subclass_depth: Optional[int] = None,
     ) -> List[List[PathEdge]] | Tuple[List[List[PathEdge]], MatchStats]:
         """Find all paths matching a fixed-length node/edge pattern.
 
@@ -2028,8 +2041,12 @@ class CSRGraph:
             so valid branches that reach an endpoint are not pruned early.
         node_subclassing : bool
             When ``True``, any string CURIE *NodeSpec* is expanded to include
-            all of its ``subclass_of`` descendants.  Dict/``None`` NodeSpecs
-            are unaffected.
+            its ``subclass_of`` descendants.  Dict/``None`` NodeSpecs are
+            unaffected.
+        subclass_depth : int, optional
+            How many subclass hops to follow when *node_subclassing* is set.
+            ``None`` (the default here) follows the hierarchy transitively;
+            ``1`` takes only direct children.
 
         Returns
         -------
@@ -2101,7 +2118,8 @@ class CSRGraph:
             return (paths, stats) if return_stats else paths
 
         start_nodes = _resolve_node_candidates(
-            node_specs[0], self, db, node_subclassing=node_subclassing
+            node_specs[0], self, db, node_subclassing=node_subclassing,
+            subclass_depth=subclass_depth,
         )
         if not start_nodes:
             return _done([])
@@ -2125,7 +2143,8 @@ class CSRGraph:
         # the reverse adjacency costs more than the pruning saves (measured
         # 0.26s of setup against a 0.00s 2-hop query).
         end_ids = _pinned_node_ids(
-            node_specs[-1], self, node_subclassing=node_subclassing
+            node_specs[-1], self, node_subclassing=node_subclassing,
+            subclass_depth=subclass_depth,
         )
         # The distance bound is computed over forward topology, so it is only
         # admissible when every hop is walked forward.
@@ -2200,6 +2219,7 @@ class CSRGraph:
                     next_node_spec,
                     graph=self,
                     node_subclassing=node_subclassing,
+                    subclass_depth=subclass_depth,
                 )
                 if allowed is not None:
                     pending = [c for c in pending if c[2] in allowed]
@@ -2381,6 +2401,7 @@ def _resolve_node_candidates(
     graph: CSRGraph,
     db: MetadataBackend,
     node_subclassing: bool = False,
+    subclass_depth: Optional[int] = None,
 ) -> List[str]:
     """Return graph node IDs that satisfy *node_spec*.
 
@@ -2400,7 +2421,7 @@ def _resolve_node_candidates(
             return []
         if node_subclassing:
             nid = graph.node_to_id[node_spec]
-            return [graph.nodes[i] for i in graph._expand_subclasses(nid)]
+            return [graph.nodes[i] for i in graph._expand_subclasses(nid, subclass_depth)]
         return [node_spec]
     # dict filter
     if "id" in node_spec:
@@ -2408,7 +2429,7 @@ def _resolve_node_candidates(
         if nid not in graph.node_to_id:
             return []
         if node_subclassing:
-            return [graph.nodes[i] for i in graph._expand_subclasses(graph.node_to_id[nid])]
+            return [graph.nodes[i] for i in graph._expand_subclasses(graph.node_to_id[nid], subclass_depth)]
         return [nid]
     if "category" in node_spec:
         # Ask the backend which nodes carry the category, rather than handing it
@@ -2434,6 +2455,7 @@ def _pinned_node_ids(
     node_spec: NodeSpec,
     graph: CSRGraph,
     node_subclassing: bool = False,
+    subclass_depth: Optional[int] = None,
 ) -> frozenset[int]:
     """Node indices a *pinned* NodeSpec resolves to, or empty if it is not pinned.
 
@@ -2453,7 +2475,7 @@ def _pinned_node_ids(
 
     nid = graph.node_to_id[curie]
     if node_subclassing:
-        return frozenset(graph._expand_subclasses(nid))
+        return frozenset(graph._expand_subclasses(nid, subclass_depth))
     return frozenset({nid})
 
 
@@ -2624,6 +2646,7 @@ def _mp_filter_nodes_batch(
     node_spec: NodeSpec,
     graph: Optional[CSRGraph] = None,
     node_subclassing: bool = False,
+    subclass_depth: Optional[int] = None,
 ) -> Optional[set]:
     """Return the subset of *node_ids* satisfying *node_spec*.
 
@@ -2639,7 +2662,7 @@ def _mp_filter_nodes_batch(
         return None
     if isinstance(node_spec, str):
         if node_subclassing and graph is not None and node_spec in graph.node_to_id:
-            valid_ids = graph._expand_subclasses(graph.node_to_id[node_spec])
+            valid_ids = graph._expand_subclasses(graph.node_to_id[node_spec], subclass_depth)
             return {graph.nodes[i] for i in valid_ids}
         return {node_spec}
     # dict filter — subclassing does not apply (category/id filter selects specific nodes)

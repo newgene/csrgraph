@@ -219,7 +219,8 @@ def query(
     *,
     limit: int = 100,
     expander: BiolinkExpander | None = None,
-    node_subclassing: bool = False,
+    node_subclassing: bool = True,
+    subclass_depth: int | None = 1,
 ) -> dict:
     """Execute a TRAPI QueryGraph against a CSRGraph and return a TRAPI Message.
 
@@ -237,10 +238,17 @@ def query(
         also answers on its descendants.  Without it, matching is literal.
     node_subclassing : bool
         Expand pinned nodes to their ``subclass_of`` descendants, so a query
-        pinned to a disease also answers on its subtypes.  Off by default to keep
-        existing behaviour, but Translator engines generally do this: it is what
-        lets "what treats Alzheimer's?" return a chemical asserted to treat a
-        *subtype* of Alzheimer's.
+        pinned to a disease also answers on its subtypes.  **On by default**,
+        matching what Translator engines do: it is what lets "what treats
+        Alzheimer's?" return a chemical asserted to treat a *subtype* of
+        Alzheimer's.  Pass ``False`` for literal matching.
+    subclass_depth : int, optional
+        Subclass hops to follow.  Defaults to ``1`` (direct children only), which
+        matches gandalf's ``subclass_depth=1`` so the two engines agree on the
+        same graph.  Pass ``None`` to expand the hierarchy **transitively**, which
+        finds more answers but diverges from engines using depth 1 — on the
+        HelmsDeep ``batch_lookup`` query transitive expansion returns 524 answers
+        against gandalf's 512.
 
     Returns
     -------
@@ -270,7 +278,7 @@ def query(
             )
             bindings = _linear_query(
                 graph, qnodes, qedges, ordered_node_keys, ordered_edge_keys, limit,
-                hop_dirs, node_subclassing,
+                hop_dirs, node_subclassing, subclass_depth,
             )
         except ValueError:
             # Branching or cyclic — use the general subgraph matcher.
@@ -297,6 +305,7 @@ def _linear_query(
     limit: int,
     hop_directions: list[bool] | None = None,
     node_subclassing: bool = False,
+    subclass_depth: int | None = None,
 ) -> list[Binding]:
     """Execute a linear-chain query via match_path and convert to bindings.
 
@@ -336,7 +345,7 @@ def _linear_query(
         remaining = limit - len(bindings)
         raw_paths = graph.match_path(
             path_spec, limit=remaining, hop_directions=hop_directions,
-            node_subclassing=node_subclassing,
+            node_subclassing=node_subclassing, subclass_depth=subclass_depth,
         )
 
         for path in raw_paths:

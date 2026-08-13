@@ -1116,3 +1116,50 @@ class TestDGIdb:
         }
         msg = query(dgidb, qg)
         assert len(msg["results"]) > 0
+
+
+class TestSubclassDepth:
+    """Subclass expansion is on by default at depth 1, with a transitive opt-in."""
+
+    @pytest.fixture(scope="class")
+    def chain_graph(self):
+        from csrgraph_kgx import CSRGraph
+
+        # D:leaf -> D:mid -> D:root, plus a chemical treating each level.
+        triples = [
+            ("D:mid", "biolink:subclass_of", "D:root"),
+            ("D:leaf", "biolink:subclass_of", "D:mid"),
+            ("C:root", "biolink:treats", "D:root"),
+            ("C:mid", "biolink:treats", "D:mid"),
+            ("C:leaf", "biolink:treats", "D:leaf"),
+        ]
+        g = CSRGraph(triples)
+        g.set_db(_StubDB())
+        return g
+
+    def _answers(self, g, **kw):
+        from trapi import query
+
+        qg = {"nodes": {"n0": {}, "n1": {"ids": ["D:root"]}},
+              "edges": {"e0": {"subject": "n0", "object": "n1",
+                               "predicates": ["biolink:treats"]}}}
+        msg = query(g, qg, limit=100, **kw)
+        return {b["id"] for r in msg["results"]
+                for b in r["node_bindings"].get("n0", [])}
+
+    def test_default_is_depth_one(self, chain_graph):
+        """Direct children only — matches gandalf's subclass_depth=1."""
+        assert self._answers(chain_graph) == {"C:root", "C:mid"}
+
+    def test_transitive_opt_in(self, chain_graph):
+        assert self._answers(chain_graph, subclass_depth=None) == {
+            "C:root", "C:mid", "C:leaf"
+        }
+
+    def test_disabled(self, chain_graph):
+        assert self._answers(chain_graph, node_subclassing=False) == {"C:root"}
+
+    def test_explicit_depth_two(self, chain_graph):
+        assert self._answers(chain_graph, subclass_depth=2) == {
+            "C:root", "C:mid", "C:leaf"
+        }
