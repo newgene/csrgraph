@@ -1163,3 +1163,82 @@ class TestSubclassDepth:
         assert self._answers(chain_graph, subclass_depth=2) == {
             "C:root", "C:mid", "C:leaf"
         }
+
+
+class TestSubclassBindingConformance:
+    """Subclass-expanded bindings must honour categories and declare query_id.
+
+    ``match_path`` expands a pinned node to its ``subclass_of`` descendants and
+    binds the descendant. Real Translator data asserts ``HP:x subclass_of
+    MONDO:y``, so a disease-constrained query could bind a phenotype — an answer
+    contradicting the query — and nothing said the bound CURIE was a stand-in for
+    the queried one.
+    """
+
+    @pytest.fixture(scope="class")
+    def graph(self):
+        from csrgraph_kgx import CSRGraph
+
+        # D:sub is a Disease subtype; P:sub is a PhenotypicFeature asserted as a
+        # subclass of the same disease, mirroring the MONDO/HP shape in the KG.
+        triples = [
+            ("D:sub", "biolink:subclass_of", "D:root"),
+            ("P:sub", "biolink:subclass_of", "D:root"),
+            ("C:root", "biolink:treats", "D:root"),
+            ("C:sub", "biolink:treats", "D:sub"),
+            ("C:phen", "biolink:treats", "P:sub"),
+        ]
+        g = CSRGraph(triples)
+        g.set_db(_StubDB(node_meta={
+            "D:root": {"id": "D:root", "category": ["biolink:Disease"]},
+            "D:sub": {"id": "D:sub", "category": ["biolink:Disease"]},
+            "P:sub": {"id": "P:sub", "category": ["biolink:PhenotypicFeature"]},
+            "C:root": {"id": "C:root", "category": ["biolink:ChemicalEntity"]},
+            "C:sub": {"id": "C:sub", "category": ["biolink:ChemicalEntity"]},
+            "C:phen": {"id": "C:phen", "category": ["biolink:ChemicalEntity"]},
+        }))
+        return g
+
+    def _run(self, g, categories):
+        from trapi import query
+
+        n1 = {"ids": ["D:root"]}
+        if categories:
+            n1["categories"] = categories
+        qg = {"nodes": {"n0": {}, "n1": n1},
+              "edges": {"e0": {"subject": "n0", "object": "n1",
+                               "predicates": ["biolink:treats"]}}}
+        msg = query(g, qg, limit=100)
+        return {b["id"]: b.get("query_id")
+                for r in msg["results"] for b in r["node_bindings"]["n1"]}
+
+    def test_expanded_node_must_satisfy_queried_category(self, graph):
+        """The phenotype subclass is dropped when the query asks for Disease."""
+        bound = self._run(graph, ["biolink:Disease"])
+        assert "P:sub" not in bound, "a PhenotypicFeature answers a Disease query"
+        assert set(bound) == {"D:root", "D:sub"}
+
+    def test_query_id_marks_expanded_nodes(self, graph):
+        bound = self._run(graph, ["biolink:Disease"])
+        # The descendant declares the CURIE it stands in for...
+        assert bound["D:sub"] == "D:root"
+        # ...and a direct hit does not, so clients can tell them apart.
+        assert bound["D:root"] is None
+
+    def test_no_category_constraint_keeps_every_subclass(self, graph):
+        """Without a categories constraint there is nothing to violate."""
+        bound = self._run(graph, None)
+        assert set(bound) == {"D:root", "D:sub", "P:sub"}
+        assert bound["P:sub"] == "D:root"
+
+    def test_disabling_subclassing_needs_no_query_id(self, graph):
+        from trapi import query
+
+        qg = {"nodes": {"n0": {}, "n1": {"ids": ["D:root"],
+                                        "categories": ["biolink:Disease"]}},
+              "edges": {"e0": {"subject": "n0", "object": "n1",
+                               "predicates": ["biolink:treats"]}}}
+        msg = query(g_ := graph, qg, limit=100, node_subclassing=False)
+        bindings = [b for r in msg["results"] for b in r["node_bindings"]["n1"]]
+        assert {b["id"] for b in bindings} == {"D:root"}
+        assert all("query_id" not in b for b in bindings)

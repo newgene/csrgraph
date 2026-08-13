@@ -334,3 +334,71 @@ earlier backend benchmarks.
 3. Surface truncation in TRAPI `message.logs` (it currently only warns).
 4. Split 400 vs 500 in `trapi_server.py`; put the corpus in CI behind a
    data-gated skip.
+
+---
+
+## Subclass-binding conformance fixed — 2026-08-13
+
+`trapi._resolve_subclass_bindings` now runs between matching and the constraint
+filters. Two changes, one root cause (expanded nodes were bound without ever
+facing their QNode again):
+
+* **`categories` enforced on expanded nodes.** `batch_lookup` no longer binds
+  `HP:0000978` and five other `PhenotypicFeature` nodes to a `biolink:Disease`
+  query node. Only the expanded CURIEs are re-checked — open nodes were already
+  category-filtered during enumeration, so validating them too would add a large
+  batched backend call per query node and find nothing.
+* **`NodeBinding.query_id` emitted.** A descendant now declares the queried CURIE
+  it stands in for: `{"id": "MONDO:0011072", "query_id": "MONDO:0005148"}`. Direct
+  hits carry no `query_id`, so a client can tell them apart. On `batch_lookup`
+  27 of the 32 `n1` bindings are expanded and 5 are direct.
+
+Corpus effect — exactly one row moves, and nothing else:
+
+| | n0 | n1 | results |
+| --- | --- | --- | --- |
+| before | 512 | 38 | 659 |
+| after | 509 | **32** | 637 |
+
+The six `HP:` nodes go, and with them three chemicals (`CHEBI:32184`,
+`CHEBI:59477`, `CHEBI:74947`) whose only route to the query was through those
+phenotypes. Every other query's answer set is unchanged.
+
+### The 3 lost n0 answers are a deliberate trade, not a regression
+
+gandalf reports those three; csrgraph now does not. This follows directly from the
+binding representation and is worth stating plainly:
+
+* Emitting the **descendant** as `id` means the descendant is the answer, so it
+  must satisfy the query node's `categories`. A phenotype cannot be bound to a
+  node constrained to `biolink:Disease`.
+* gandalf instead binds the **queried** CURIE, so its `n1` is always one of the
+  six MONDO diseases and the category holds trivially — which lets a chemical
+  treating "Easy Bruising" answer "what treats skin vascular disease?".
+
+Both are self-consistent; they differ on whether treating a phenotypic subtype
+answers a question about the parent disease. csrgraph's reading is the stricter
+one and is the only one compatible with reporting the descendant as the answer.
+If the looser reading is wanted, the change is to bind the queried CURIE and move
+the descendant into `query_id`'s place — not to drop the category check, which
+would put contradictory answers back.
+
+### Remaining differences after this fix
+
+| qtype | node | csr | gandalf | note |
+| --- | --- | --- | --- | --- |
+| `one_hop_lookup_open` | n1 | 2 | 1 | expanded subtype, now with `query_id` |
+| `one_hop_no_predicate` | n1 | 4 | 1 | same |
+| `mvp1_heavy` / `mvp1_medium` | n1 | 2 | 1 | same |
+| `mvp1_light` | n1 | 3 | 1 | same |
+| `batch_lookup` | n0 / n1 | 509 / 32 | 512 / 6 | see trade-off above |
+
+These are now a **representation** difference rather than a defect: csrgraph
+reports which subtype matched, gandalf reports the queried term. Four queries
+remain byte-identical.
+
+The one genuine correctness item still open is backend-dependent truncation:
+`limit` truncates enumeration in whatever order the backend yields, so LMDB and ES
+keep different subsets (disjoint on `two_hop_lookup`'s `n1`). Both subsets are
+provably inside the uncapped answer set, so neither is wrong, but the same query
+should not depend on the configured backend.

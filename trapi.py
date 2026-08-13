@@ -284,12 +284,16 @@ def query(
             # Branching or cyclic — use the general subgraph matcher.
             bindings = _general_match(graph, qnodes, qedges, limit)
 
-    # Post-filter pipeline: node constraints → edge attributes → qualifiers.
+    # Post-filter pipeline: subclass validation → node constraints →
+    # edge attributes → qualifiers.
+    bindings, query_ids = _resolve_subclass_bindings(
+        graph, bindings, qnodes, node_subclassing, subclass_depth
+    )
     bindings = _apply_node_constraint_filters(graph, bindings, qnodes)
     bindings = _apply_edge_attribute_constraints(graph, bindings, qedges)
     bindings = _apply_qualifier_filters(graph, bindings, qedges)
 
-    return _build_message(graph, query_graph, bindings)
+    return _build_message(graph, query_graph, bindings, query_ids)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1257,10 +1261,86 @@ def _matches_qualifier_set(edge_meta: dict, qualifiers: list[dict]) -> bool:
 # TRAPI response assembly (works with bindings from both paths)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _resolve_subclass_bindings(
+    graph: CSRGraph,
+    bindings: list[Binding],
+    qnodes: dict[str, dict],
+    node_subclassing: bool,
+    subclass_depth: int | None,
+) -> tuple[list[Binding], dict[str, dict[str, str]]]:
+    """Validate subclass-expanded bindings and record what each was queried as.
+
+    ``match_path`` expands a pinned node to its ``subclass_of`` descendants and
+    binds the descendant directly, and nothing downstream re-examined it.  Two
+    consequences, both measured on the HelmsDeep ``batch_lookup`` query:
+
+    * **The descendant never faced the QNode's ``categories``.** This graph
+      asserts ``HP:x subclass_of MONDO:y``, so a query pinned to diseases *and
+      constrained to* ``biolink:Disease`` bound six ``PhenotypicFeature`` nodes
+      (``HP:0000978`` "Easy Bruising" among them).  Those answers contradict the
+      query, which is worse than missing ones, so they are dropped here.
+    * **A descendant is not the CURIE the caller asked for.** TRAPI says so with
+      ``NodeBinding.query_id``; without it a client cannot distinguish a subtype
+      match from a direct hit.  The returned map supplies it.
+
+    Only the *expanded* CURIEs are checked, not every bound node: open nodes were
+    already category-filtered during enumeration, so re-validating them would add
+    a large batched backend call per query node and find nothing.
+    """
+    if not bindings:
+        return bindings, {}
+
+    db = graph.db
+    query_ids: dict[str, dict[str, str]] = {}
+    drop: dict[str, set[str]] = {}
+
+    for nk, qn in qnodes.items():
+        ids = qn.get("ids")
+        if not ids or not node_subclassing:
+            continue
+        bound = {b["nodes"][nk] for b in bindings if nk in b["nodes"]}
+        expanded = bound - set(ids)
+        if not expanded:
+            continue
+
+        # Which queried CURIE did each descendant come from?  Expand the same
+        # way match_path did so the two agree.
+        mapping: dict[str, str] = {}
+        for qid in ids:
+            if qid not in graph.node_to_id:
+                continue
+            for i in graph._expand_subclasses(graph.node_to_id[qid], subclass_depth):
+                curie = graph.nodes[i]
+                if curie in expanded:
+                    mapping.setdefault(curie, qid)
+        if mapping:
+            query_ids[nk] = mapping
+
+        categories = qn.get("categories")
+        if categories:
+            ok: set[str] = set()
+            for cat in categories:
+                ok.update(
+                    m["id"] for m in db.filter_nodes(sorted(expanded), category=cat)
+                )
+            bad = expanded - ok
+            if bad:
+                drop[nk] = bad
+
+    if drop:
+        bindings = [
+            b for b in bindings
+            if not any(b["nodes"].get(k) in bad for k, bad in drop.items())
+        ]
+
+    return bindings, query_ids
+
+
 def _build_message(
     graph: CSRGraph,
     query_graph: dict,
     bindings: list[Binding],
+    query_ids: dict[str, dict[str, str]] | None = None,
 ) -> dict:
     """Assemble a TRAPI Message from bindings."""
     db = graph.db
@@ -1278,7 +1358,13 @@ def _build_message(
         edge_bindings: dict[str, list[dict]] = {}
 
         for nk, curie in binding["nodes"].items():
-            node_bindings[nk] = [{"id": curie, "attributes": []}]
+            nb: dict[str, Any] = {"id": curie, "attributes": []}
+            # A subclass-expanded node is not the CURIE that was asked for, so
+            # say which one it stands in for.
+            queried = (query_ids or {}).get(nk, {}).get(curie)
+            if queried is not None:
+                nb["query_id"] = queried
+            node_bindings[nk] = [nb]
             if curie not in kg_nodes:
                 kg_nodes[curie] = _make_kg_node(db, curie)
 
