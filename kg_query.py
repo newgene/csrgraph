@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Iterable, List, Literal, Optional, Sequence, Tuple, overload
 
 from csrgraph_kgx import CSRGraph, MatchStats
-from metadata_db import ElasticsearchMetadataBackend
+from metadata_db import ElasticsearchMetadataBackend, LMDBMetadataBackend
 
 # --------------------------------------------------------------------------- #
 # Defaults (env-overridable, matching trapi_server.py conventions)
@@ -58,12 +58,31 @@ def get_graph(
     name: str = DEFAULT_GRAPH,
     data_dir: str | os.PathLike = DEFAULT_DATA_DIR,
     es_host: str = DEFAULT_ES_HOST,
+    backend: str = "auto",
 ) -> CSRGraph:
-    """Load (and cache) a graph by stem name with an Elasticsearch backend.
+    """Load (and cache) a graph by stem name with a metadata backend attached.
 
     Defaults to the ``translator_kg_2026-07-19`` snapshot in ``~/tmp/csrgraph_data``.
     The result is memoised, so repeated calls in one process reuse the same
     in-memory graph.
+
+    Parameters
+    ----------
+    backend:
+        ``"es"`` for Elasticsearch (full-text ``resolve`` works), ``"lmdb"`` for
+        the on-disk store beside the snapshot, or ``"auto"`` (default) to prefer
+        LMDB when the directory has one and fall back to Elasticsearch.
+
+        ``auto`` exists because this used to hardcode Elasticsearch, which made a
+        release directory unusable: a release ships an LMDB store and no ES index,
+        so the graph's topology loaded while every metadata lookup came back empty
+        against an index that did not exist — ``neighbors()`` worked and
+        ``get_edge()`` returned ``{}``. Preferring the store that is actually
+        present avoids answering with silent emptiness.
+
+        Note ``resolve``/``resolve_one`` need Elasticsearch: name and symbol
+        lookup is a full-text query with no LMDB equivalent. Pass
+        ``backend="es"`` for those.
     """
     data_dir = Path(data_dir).expanduser()
     snapshot = data_dir / f"{name}.csrgraph.pkl.zst"
@@ -73,7 +92,17 @@ def get_graph(
             f"Available graphs in {data_dir}: "
             + ", ".join(sorted(p.name.split('.')[0] for p in data_dir.glob('*.csrgraph.pkl.zst')))
         )
-    db = ElasticsearchMetadataBackend(es_host, index_prefix=name)
+    lmdb_path = data_dir / f"{name}.metadata.lmdb"
+    if backend not in {"auto", "es", "lmdb"}:
+        raise ValueError(f"backend must be 'auto', 'es' or 'lmdb', not {backend!r}")
+    use_lmdb = backend == "lmdb" or (backend == "auto" and lmdb_path.exists())
+    if use_lmdb:
+        if not lmdb_path.exists():
+            raise FileNotFoundError(f"LMDB store not found: {lmdb_path}")
+        # Read-only: never write lock.mdb into a directory we are only reading.
+        db: object = LMDBMetadataBackend(str(lmdb_path), readonly=True)
+    else:
+        db = ElasticsearchMetadataBackend(es_host, index_prefix=name)
     return CSRGraph.load(str(snapshot), db=db)
 
 

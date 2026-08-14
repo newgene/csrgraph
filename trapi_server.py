@@ -33,6 +33,7 @@ Example query (curl)::
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -73,6 +74,7 @@ _DEFAULT_LIMIT = 1000
 
 from csrgraph_kgx import CSRGraph
 from metadata_db import (
+    STORE_FORMAT_VERSION,
     ElasticsearchMetadataBackend,
     HybridMetadataBackend,
     LMDBMetadataBackend,
@@ -86,6 +88,43 @@ from trapi import display_query_graph, query
 # Graph and DB are loaded once at startup (populated in main / lifespan).
 _graph: CSRGraph | None = None
 _db: HybridMetadataBackend | None = None
+#: Release manifest for the loaded DATA_DIR, or ``None`` when serving an
+#: unversioned directory built by hand (see F1/F2 in
+#: docs/production-release-plan.md).
+_manifest: dict | None = None
+
+
+class StoreFormatMismatch(RuntimeError):
+    """The release's store format is not one this code can read."""
+
+
+def _read_manifest(data_dir: Path) -> dict | None:
+    """Load and validate ``manifest.json`` from *data_dir*.
+
+    Raises :class:`StoreFormatMismatch` when the release was built by code with a
+    different key layout.  **Failing to start is the desired behaviour**: a
+    version-1 store read by version-2 code matches nothing, so the server would
+    otherwise come up healthy and answer every qualifier-constrained query with
+    an empty result — silently wrong, and far harder to notice than a refusal.
+    """
+    path = data_dir / "manifest.json"
+    if not path.exists():
+        print(f"No manifest.json in {data_dir}; serving an unversioned directory. "
+              f"Store format is unchecked — build releases with make_release.py "
+              f"to get a version gate.")
+        return None
+    manifest = json.loads(path.read_text())
+    found = manifest.get("store_format_version")
+    if found != STORE_FORMAT_VERSION:
+        raise StoreFormatMismatch(
+            f"{path} declares store_format_version {found!r}, but this code reads "
+            f"{STORE_FORMAT_VERSION}. Refusing to serve: the key layouts differ, so "
+            f"metadata lookups would return nothing rather than fail. Rebuild the "
+            f"release with make_release.py, or deploy matching code."
+        )
+    print(f"Release {manifest.get('graph_name')} {manifest.get('version')} "
+          f"(store format {found})")
+    return manifest
 
 
 @asynccontextmanager
@@ -120,7 +159,7 @@ def _load_graph(
     es_host: str = "http://localhost:9200",
     no_es: bool = False,
 ) -> None:
-    global _graph, _db
+    global _graph, _db, _manifest
 
     graph_path = data_dir / f"{graph_name}.csrgraph.pkl.zst"
     lmdb_path = data_dir / f"{graph_name}.metadata.lmdb"
@@ -130,9 +169,15 @@ def _load_graph(
     if not lmdb_path.exists():
         sys.exit(f"LMDB metadata not found: {lmdb_path}")
 
+    # Check the release before loading anything: a format mismatch should cost
+    # nothing to detect.
+    _manifest = _read_manifest(data_dir)
+
     # -- LMDB (always required) --
+    # Read-only: a release directory is immutable, and opening read-write would
+    # write lock.mdb into it — which also fails outright on a read-only mount.
     print(f"Loading LMDB metadata from {lmdb_path} ...")
-    lmdb_be = LMDBMetadataBackend(str(lmdb_path))
+    lmdb_be = LMDBMetadataBackend(str(lmdb_path), readonly=True)
 
     # -- Elasticsearch (optional, graceful fallback) --
     es_be = None
@@ -996,10 +1041,52 @@ async def meta():
     }
 
 
+def _version_payload() -> dict:
+    """What `/version` and `/health` both report."""
+    ready = _graph is not None
+    payload: dict = {
+        "ready": ready,
+        "store_format_version": STORE_FORMAT_VERSION,
+        "versioned_release": _manifest is not None,
+    }
+    if _manifest is not None:
+        payload.update({
+            "graph_name": _manifest.get("graph_name"),
+            "version": _manifest.get("version"),
+            "built_at": _manifest.get("built_at"),
+            "source_kgx": _manifest.get("source_kgx"),
+            "node_count": _manifest.get("node_count"),
+            "edge_count": _manifest.get("edge_count"),
+            "variant_count": _manifest.get("variant_count"),
+        })
+    if ready:
+        payload["loaded"] = {
+            "nodes": _graph.num_nodes,
+            "predicates": len(_graph.relations),
+        }
+    return payload
+
+
+@app.get("/version")
+async def version() -> JSONResponse:
+    """Deployed release identity and readiness.
+
+    The gate for a health-checked swap: an updater flips traffic only once this
+    reports the version it just installed, and a Kubernetes readiness probe uses
+    the same signal so a rolling update drains old pods only after new ones serve.
+    Returns 503 until the graph is loaded, so "up" and "ready" stay distinct.
+    """
+    payload = _version_payload()
+    return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
+
+
 @app.get("/health")
-async def health() -> dict:
-    """Health check."""
-    return {"status": "ok", "graph_loaded": _graph is not None}
+async def health() -> JSONResponse:
+    """Health check, including the deployed release."""
+    payload = _version_payload()
+    payload["status"] = "ok" if payload["ready"] else "loading"
+    payload["graph_loaded"] = payload["ready"]
+    return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1046,7 +1133,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    _load_graph(args.data_dir, args.graph, es_host=args.es_host, no_es=args.no_es)
+    try:
+        _load_graph(args.data_dir, args.graph, es_host=args.es_host, no_es=args.no_es)
+    except StoreFormatMismatch as exc:
+        # Exit non-zero with the operator-facing reason, not a traceback. A
+        # supervisor that restarts on failure will keep failing, which is correct:
+        # the fix is a rebuild or a code rollback, not a retry.
+        sys.exit(f"\nSTORE FORMAT MISMATCH\n{exc}")
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port)

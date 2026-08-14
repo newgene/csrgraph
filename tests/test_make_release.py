@@ -188,3 +188,138 @@ def test_published_release_is_loadable(archive: Path, tmp_path: Path):
         assert len(variants) == 2, "both qualifier variants survived packaging"
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# F3 — the server's view of a release
+# ---------------------------------------------------------------------------
+
+def _publish(archive: Path, tmp_path: Path) -> Path:
+    out = tmp_path / "releases"
+    assert _run(archive, out).returncode == 0
+    return out / "v1"
+
+
+def test_store_format_mismatch_refuses_to_serve(archive: Path, tmp_path: Path):
+    """The whole reason the manifest carries a format version.
+
+    A version-1 store read by version-2 code matches nothing, so the server would
+    otherwise start healthy and answer every qualifier-constrained query with an
+    empty result. Refusing to start is the desired behaviour.
+    """
+    import trapi_server
+
+    rel = _publish(archive, tmp_path)
+    manifest = json.loads((rel / "manifest.json").read_text())
+    manifest["store_format_version"] = STORE_FORMAT_VERSION + 1
+    (rel / "manifest.json").write_text(json.dumps(manifest))
+
+    with pytest.raises(trapi_server.StoreFormatMismatch) as exc:
+        trapi_server._read_manifest(rel)
+    # The message must name both versions; an operator needs to know which side
+    # to move.
+    assert str(STORE_FORMAT_VERSION) in str(exc.value)
+    assert str(STORE_FORMAT_VERSION + 1) in str(exc.value)
+
+
+def test_matching_release_is_accepted(archive: Path, tmp_path: Path):
+    import trapi_server
+
+    rel = _publish(archive, tmp_path)
+    manifest = trapi_server._read_manifest(rel)
+    assert manifest is not None
+    assert manifest["store_format_version"] == STORE_FORMAT_VERSION
+
+
+def test_unversioned_directory_is_allowed(tmp_path: Path):
+    """Hand-built directories predate releases and must keep working."""
+    import trapi_server
+
+    assert trapi_server._read_manifest(tmp_path) is None
+
+
+def test_version_endpoint_reports_the_release(archive: Path, tmp_path: Path):
+    fastapi = pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    import trapi_server
+
+    rel = _publish(archive, tmp_path)
+    # Point the app at the release the way a deployment would.
+    import os
+    os.environ.update(DATA_DIR=str(rel), GRAPH_NAME="kg", NO_ES="1")
+    trapi_server._graph = None
+    trapi_server._manifest = None
+    trapi_server._DEFAULT_DATA_DIR = rel  # type: ignore[attr-defined]
+    try:
+        with TestClient(trapi_server.app) as c:
+            for route in ("/version", "/health"):
+                r = c.get(route)
+                assert r.status_code == 200, route
+                d = r.json()
+                assert d["ready"] is True
+                assert d["versioned_release"] is True
+                assert d["graph_name"] == "kg"
+                assert d["version"] == "v1"
+                assert d["store_format_version"] == STORE_FORMAT_VERSION
+                assert d["node_count"] == 2
+                assert d["variant_count"] == 3
+                assert d["loaded"]["nodes"] == 2
+    finally:
+        if trapi_server._db is not None:
+            trapi_server._db.close()
+        trapi_server._graph = None
+        trapi_server._db = None
+        trapi_server._manifest = None
+
+
+# ---------------------------------------------------------------------------
+# F4 — read-only store access
+# ---------------------------------------------------------------------------
+
+def test_readonly_open_writes_nothing(archive: Path, tmp_path: Path):
+    """A serving process must not mutate the release directory it was handed.
+
+    Opening read-write creates ``lock.mdb`` inside the store, which also makes a
+    read-only mount unusable — the shared-volume deployment this exists for.
+    """
+    from metadata_db import LMDBMetadataBackend
+
+    rel = _publish(archive, tmp_path)
+    store = rel / "kg.metadata.lmdb"
+    (store / "lock.mdb").unlink(missing_ok=True)
+    before = sorted(p.name for p in store.iterdir())
+
+    db = LMDBMetadataBackend(str(store), readonly=True)
+    try:
+        assert db.readonly is True
+        # Every read path must work through handles opened with create=False.
+        assert len(db.get_edge_variants("CHEBI:V", "biolink:affects", "NCBIGene:V")) == 2
+        assert db.get_node("CHEBI:V")["name"] == "DrugV"
+        assert db.filter_nodes(["CHEBI:V"], category="biolink:SmallMolecule")
+        assert db.nodes_by_category("biolink:Gene", limit=5)
+    finally:
+        db.close()
+
+    assert sorted(p.name for p in store.iterdir()) == before, "read-only open wrote a file"
+
+
+def test_readonly_open_works_on_a_read_only_directory(archive: Path, tmp_path: Path):
+    """The deployment case: a ReadOnlyMany volume shared across pods."""
+    import stat
+
+    from metadata_db import LMDBMetadataBackend
+
+    rel = _publish(archive, tmp_path)
+    store = rel / "kg.metadata.lmdb"
+    (store / "lock.mdb").unlink(missing_ok=True)
+    mode = store.stat().st_mode
+    store.chmod(mode & ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH)
+    try:
+        db = LMDBMetadataBackend(str(store), readonly=True)
+        try:
+            assert len(db.get_edge_variants("CHEBI:V", "biolink:affects", "NCBIGene:V")) == 2
+        finally:
+            db.close()
+    finally:
+        store.chmod(mode)

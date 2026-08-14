@@ -1302,6 +1302,10 @@ class LMDBMetadataBackend(MetadataBackend):
     Open an existing environment::
 
         db = LMDBMetadataBackend("kg.lmdb")
+
+    Open one for serving, without writing ``lock.mdb`` into it::
+
+        db = LMDBMetadataBackend("kg.lmdb", readonly=True)
     """
 
     _SEP = b"\x00"
@@ -1313,17 +1317,62 @@ class LMDBMetadataBackend(MetadataBackend):
     #: (≤ 10k, see ``_MP_FILTER_BATCH``) always probe.
     _CAT_PROBE_MAX = 50_000
 
-    def __init__(self, db_path: str, *, map_size: int = 50 * 1024 ** 3) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        map_size: int = 50 * 1024 ** 3,
+        readonly: bool = False,
+        lock: bool | None = None,
+    ) -> None:
+        """Open an existing LMDB metadata environment.
+
+        Parameters
+        ----------
+        readonly:
+            Open the environment read-only.  The default (``False``) opens
+            read-write, which **creates ``lock.mdb`` in the store directory** —
+            so a serving process mutates the release directory it was given, and
+            cannot open one at all on a read-only mount.  Set this on any serving
+            path: a release is immutable by design, and shared read-only volumes
+            (a ``ReadOnlyMany`` PVC across pods) are a supported deployment.
+            Read-only LMDB access is safe from many readers at once.
+        lock:
+            Whether to use the lock file.  Defaults to ``not readonly``.  Passing
+            ``readonly=True`` with ``lock=True`` still requires the directory to
+            be writable, which defeats the purpose; the default pairing is the
+            one you almost always want.  Only override if readers must
+            coordinate with a concurrent writer, which a released store has none
+            of.
+        """
         try:
             import lmdb
         except ImportError:
             raise ImportError("LMDBMetadataBackend requires: pip install lmdb") from None
-        self._env      = lmdb.open(db_path, max_dbs=5, map_size=map_size)
-        self._nodes_db = self._env.open_db(b"nodes")
-        self._cats_db  = self._env.open_db(b"node_cats")
-        self._edges_db = self._env.open_db(b"edges")
-        self._kl_db    = self._env.open_db(b"edge_kl")
-        self._meta_db  = self._env.open_db(b"_meta")
+        if lock is None:
+            lock = not readonly
+        self.readonly = readonly
+        self._env = lmdb.open(
+            db_path, max_dbs=5, map_size=map_size, readonly=readonly, lock=lock,
+        )
+        # A read-only env cannot *create* sub-databases, so the handles must be
+        # opened with create=False.  Opening them inside an explicit
+        # ``env.begin()`` block instead looks equivalent but is not: py-lmdb
+        # aborts a read transaction on context exit, and a handle from an aborted
+        # transaction is invalid — every later cursor fails with
+        # ``mdb_cursor_open: Invalid argument``.
+        if readonly:
+            self._nodes_db = self._env.open_db(b"nodes", create=False)
+            self._cats_db  = self._env.open_db(b"node_cats", create=False)
+            self._edges_db = self._env.open_db(b"edges", create=False)
+            self._kl_db    = self._env.open_db(b"edge_kl", create=False)
+            self._meta_db  = self._env.open_db(b"_meta", create=False)
+        else:
+            self._nodes_db = self._env.open_db(b"nodes")
+            self._cats_db  = self._env.open_db(b"node_cats")
+            self._edges_db = self._env.open_db(b"edges")
+            self._kl_db    = self._env.open_db(b"edge_kl")
+            self._meta_db  = self._env.open_db(b"_meta")
         self._indexed_node_fields: list[str] = []
         self._indexed_edge_fields: list[str] = []
         try:

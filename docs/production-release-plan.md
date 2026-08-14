@@ -38,18 +38,16 @@ These pieces are built once and consumed by both deployment models. Three are sm
 code touch-points; the artifact/manifest is the common contract; F5 and F6 are the gates and
 constraints that a session of building and rebuilding these stores showed were missing.
 
-**Status: F1 and F2 are implemented** (`make_release.py`, `tests/test_make_release.py`);
-F3–F6 are not. The stores this repo runs against were built by hand, and the hand-work is what
+**Status: F1–F4 are implemented** (`make_release.py`, `tests/test_make_release.py`);
+F5 and F6 are not. The stores this repo runs against were built by hand, and the hand-work is what
 the plan encodes.
 
-**Found while testing F1's output: `kg_query.get_graph()` cannot serve a release.** It
-hardcodes `ElasticsearchMetadataBackend(es_host, index_prefix=name)` with no LMDB option and no
-fallback, so pointing it at a release directory yields a graph whose topology loads and whose
-every metadata lookup fails against a nonexistent index — `neighbors()` works, `get_edge()`
-returns `{}`. A release ships an LMDB store, not an ES index, so this is a real gap in the
-serving path and belongs to F3: the server should prefer the release's own LMDB. `trapi_server.py`
-is unaffected and already correct — with `NO_ES=1` it serves a release directly, verified
-end-to-end returning results with metadata from the release's own store.
+**Fixed as part of F3: `kg_query.get_graph()` could not serve a release.** It hardcoded
+`ElasticsearchMetadataBackend` with no LMDB option and no fallback, so a release directory
+yielded a graph whose topology loaded while every metadata lookup failed against a nonexistent
+index — `neighbors()` worked, `get_edge()` returned `{}`. It now takes
+`backend="auto"|"lmdb"|"es"`, preferring the store that is actually present. `resolve`/
+`resolve_one` still need `backend="es"`: full-text lookup has no LMDB equivalent.
 
 ### F1. Release packaging step (`make_release.py`) — **IMPLEMENTED**
 Produce an **immutable release directory** from a KGX archive, reusing existing builders.
@@ -135,7 +133,7 @@ regression that cost 754,788 assertions here.
 Published to object storage (S3/GCS/HTTPS) as the **last, atomic** step of an upstream build so
 no consumer ever sees a half-written manifest. This is the single source both scenarios poll.
 
-### F3. Version/health endpoint (modify `trapi_server.py`)
+### F3. Version/health endpoint (`trapi_server.py`) — **IMPLEMENTED**
 The server currently has no version awareness, which blocks health-gated swaps and rollback.
 - In `_load_graph()` / `_lifespan()`, read `manifest.json` from `DATA_DIR` at startup and stash
   `graph_name` + `version` + `store_format_version` + counts.
@@ -148,11 +146,20 @@ The server currently has no version awareness, which blocks health-gated swaps a
 - The existing `/query` route already separates client error (400, invalid query graph) from
   server fault (500), so 5xx alerting is meaningful; `503` remains "graph not loaded".
 
-### F4. LMDB read-only open option (modify `metadata_db.py`)
+### F4. LMDB read-only open option (`metadata_db.py`) — **IMPLEMENTED**
 `LMDBMetadataBackend.__init__` opens the env **read-write** (writes `lock.mdb`). Add an option
 (env/arg, e.g. `readonly=True, lock=False`) for the serving path. Needed so releases can live on
 read-only mounts / shared RO volumes (scenario 2 option C) and so the serving process never
 mutates an immutable release dir. Build path stays read-write.
+
+Implemented as `LMDBMetadataBackend(path, readonly=True)`, with `lock` defaulting to
+`not readonly`. `trapi_server` and `kg_query` both use it on the serving path. One
+non-obvious detail: a read-only environment cannot *create* sub-databases, so the named
+handles must be opened with `create=False` — opening them inside an explicit `env.begin()`
+block looks equivalent but py-lmdb aborts a read transaction on context exit, and handles
+from an aborted transaction fail every later cursor with `mdb_cursor_open: Invalid argument`.
+Verified against a `chmod`-ed read-only directory: `readonly=True` serves it,
+`readonly=False` fails with `ReadonlyError: Permission denied`.
 
 ### F5. Release gates (new — promote nothing that has not passed these)
 
