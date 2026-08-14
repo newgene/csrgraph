@@ -1464,3 +1464,64 @@ class TestSymmetricHops:
         assert len(paths) == 1, f"duplicate assertion emitted twice: {paths}"
         # Forward is walked first, so its orientation is the one kept.
         assert paths[0][0] == ("C:1", "biolink:interacts_with", "C:2")
+
+
+class TestGeneralMatchSymmetryIsPerPredicate:
+    """Candidate gathering must not treat a whole hop as symmetric.
+
+    ``_get_edge_neighbors`` searched the opposite direction for *every* queried
+    predicate whenever one of them was symmetric, so a hop listing
+    ``[treats, interacts_with]`` proposed nodes reachable only by walking a
+    one-way ``treats`` backwards. ``_matching_predicates`` rejected them at
+    verification, so this cost work rather than answers — but it is the same
+    per-hop-versus-per-predicate confusion that *did* produce wrong answers in
+    ``match_path``.
+    """
+
+    @pytest.fixture(scope="class")
+    def graph(self):
+        from csrgraph_kgx import CSRGraph
+
+        g = CSRGraph([
+            ("C:1", "biolink:treats", "D:1"),          # one-way
+            ("C:1", "biolink:interacts_with", "C:2"),  # symmetric
+        ])
+        g.set_db(_StubDB())
+        return g
+
+    @staticmethod
+    def _qedge(*predicates):
+        return {"subject": "n0", "object": "n1", "predicates": list(predicates)}
+
+    def test_asymmetric_predicate_is_not_searched_backwards(self, graph):
+        from trapi import _get_edge_neighbors
+
+        # D:1 is the *object* of the only treats edge, so searching forward from
+        # it must find nothing however the hop's other predicates behave.
+        assert _get_edge_neighbors(
+            graph, self._qedge("biolink:treats"), "D:1", True) == []
+        assert _get_edge_neighbors(
+            graph, self._qedge("biolink:treats", "biolink:interacts_with"),
+            "D:1", True) == [], "one-way predicate searched backwards"
+
+    def test_symmetric_predicate_is_still_searched_backwards(self, graph):
+        from trapi import _get_edge_neighbors
+
+        # C:2 is the object of the interacts_with edge; symmetry must still
+        # reach C:1, on its own and alongside an asymmetric sibling.
+        assert _get_edge_neighbors(
+            graph, self._qedge("biolink:interacts_with"), "C:2", True) == ["C:1"]
+        assert _get_edge_neighbors(
+            graph, self._qedge("biolink:treats", "biolink:interacts_with"),
+            "C:2", True) == ["C:1"]
+
+    def test_general_match_agrees(self, graph):
+        """End to end, the verifier and the gatherer reach the same verdict."""
+        from trapi import _general_match
+
+        qnodes = {"n0": {"ids": ["D:1"]}, "n1": {"ids": ["C:1"]}}
+        bindings, _ = _general_match(
+            graph, qnodes,
+            {"e0": self._qedge("biolink:treats", "biolink:interacts_with")}, 10,
+        )
+        assert bindings == []

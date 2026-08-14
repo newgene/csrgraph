@@ -974,33 +974,45 @@ def _get_edge_neighbors(
     When forward=False, source is the object; we look for nodes that have
     edges pointing TO source (i.e., source is the object, we need subjects).
 
-    For symmetric predicates, both directions are searched automatically.
+    The opposite direction is searched too, but **only for this QEdge's
+    symmetric predicates**.  Searching it for all of them whenever one happened
+    to be symmetric gathered candidates reachable only by a one-way predicate
+    walked backwards — a query for ``[treats, interacts_with]`` proposing a
+    disease as something that treats a drug.  ``_matching_predicates`` rejects
+    those at verification, so it cost work rather than answers, but it is the
+    same per-hop-versus-per-predicate confusion fixed in ``match_path`` and in
+    ``_matching_predicates`` itself.
+
+    A wildcard QEdge (no ``predicates``) does not get the reverse search, which
+    matches the linear fast path: ``_linear_query`` derives its symmetric extra
+    spec from the predicate list, so an absent list yields no extra walk.
     """
     predicates = qedge.get("predicates")
-    has_symmetric = predicates and any(p in SYMMETRIC_PREDICATES for p in predicates)
+    symmetric_preds = [p for p in (predicates or []) if p in SYMMETRIC_PREDICATES]
+
+    def _forward_neighbors(preds: list[str] | None) -> set[str]:
+        out: set[str] = set()
+        if preds:
+            for pred in preds:
+                out.update(graph.neighbors(source_curie, relation=pred))
+        else:
+            out.update(graph.neighbors(source_curie))
+        return out
 
     if forward:
-        result: set[str] = set()
-        if predicates:
-            for pred in predicates:
-                result.update(graph.neighbors(source_curie, relation=pred))
-        else:
-            result.update(graph.neighbors(source_curie))
-        # Symmetric: also get reverse neighbors (nodes pointing TO source).
-        if has_symmetric:
-            result.update(_reverse_neighbors(graph, source_curie, predicates))
+        result = _forward_neighbors(predicates)
+        if symmetric_preds:
+            result.update(
+                _reverse_neighbors(graph, source_curie, symmetric_preds)
+            )
         return list(result)
 
-    # Reverse direction.
-    result_set = set(_reverse_neighbors(graph, source_curie, predicates))
-    # Symmetric: also get forward neighbors.
-    if has_symmetric:
-        if predicates:
-            for pred in predicates:
-                result_set.update(graph.neighbors(source_curie, relation=pred))
-        else:
-            result_set.update(graph.neighbors(source_curie))
-    return list(result_set)
+    # Reverse direction: the primary lookup uses every queried predicate, the
+    # symmetric extra only the symmetric ones.
+    result = set(_reverse_neighbors(graph, source_curie, predicates))
+    if symmetric_preds:
+        result.update(_forward_neighbors(symmetric_preds))
+    return list(result)
 
 
 def _reverse_neighbors(
