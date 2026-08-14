@@ -186,7 +186,17 @@ def _load_graph(
             es_be = ElasticsearchMetadataBackend(
                 host=es_host, index_prefix=graph_name,
             )
-            print(f"ES connected: {es_host}")
+            # F6: an ES index cannot live inside the release directory, so it
+            # carries its own format stamp.  Checked here rather than in the
+            # backend constructor because it costs two round trips.  A version
+            # mismatch is fatal for the same reason the manifest one is — the
+            # index answers, just with fewer results than exist — while an
+            # unreachable cluster is not, since LMDB alone can serve.
+            compat = es_be.check_compatibility()
+            print(f"ES connected: {es_host} "
+                  f"(server {compat['server']}, client {compat['client']})")
+        except RuntimeError:
+            raise
         except Exception as exc:
             print(f"ES unavailable ({exc}); falling back to LMDB-only")
 

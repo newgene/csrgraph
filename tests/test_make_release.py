@@ -323,3 +323,82 @@ def test_readonly_open_works_on_a_read_only_directory(archive: Path, tmp_path: P
             db.close()
     finally:
         store.chmod(mode)
+
+
+# ---------------------------------------------------------------------------
+# F5 — release gates
+# ---------------------------------------------------------------------------
+
+def test_completeness_gate_accepts_correct_counts(archive: Path):
+    """The archive is recounted independently and must agree with the stores."""
+    make_release._gate_completeness(archive, distinct=2, variants=3)
+
+
+def test_completeness_gate_catches_a_dropped_variant(archive: Path):
+    """The regression this gate exists for.
+
+    A store keyed without the qualifier fingerprint collapses the two `affects`
+    assertions into one, so it holds 2 variants where the source has 3.
+    """
+    with pytest.raises(SystemExit) as exc:
+        make_release._gate_completeness(archive, distinct=2, variants=2)
+    assert "dropping assertions" in str(exc.value)
+
+
+def test_completeness_gate_catches_a_short_graph(archive: Path):
+    with pytest.raises(SystemExit) as exc:
+        make_release._gate_completeness(archive, distinct=1, variants=3)
+    assert "not a faithful copy" in str(exc.value)
+
+
+def test_gate_hash_is_reproducible():
+    """A gate whose numbers change between runs is a gate nobody can check.
+
+    The builtin hash() is salted per process, so it cannot be used here even
+    though cardinality would be unaffected.
+    """
+    import subprocess
+
+    def digest(seed: str) -> str:
+        return subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r); import make_release; "
+             "print(make_release._h64('CHEBI:1|biolink:affects|NCBIGene:1'))" % str(ROOT)],
+            capture_output=True, text=True,
+            env={**__import__("os").environ, "PYTHONHASHSEED": seed},
+        ).stdout.strip()
+
+    assert digest("1") == digest("2") == digest("12345")
+
+
+# ---------------------------------------------------------------------------
+# F6 — Elasticsearch version coupling
+# ---------------------------------------------------------------------------
+
+def test_es_client_major_mismatch_is_explained():
+    """A newer client is refused during content negotiation.
+
+    The raw error talks about media types and says nothing about the real
+    problem, so it is translated into an actionable one.
+    """
+    pytest.importorskip("elasticsearch")
+    from elastic_transport import ApiResponseMeta
+    from elasticsearch import BadRequestError
+
+    from metadata_db import ElasticsearchMetadataBackend as ES
+
+    db = ES.__new__(ES)                       # no connection needed
+    meta = ApiResponseMeta(status=400, http_version="1.1", headers={},
+                           duration=0.0, node=None)
+    err = BadRequestError("media_type_header_exception", meta=meta, body={})
+
+    class _FakeES:
+        def info(self):
+            raise err
+
+    db._es = _FakeES()  # type: ignore[assignment]
+    with pytest.raises(RuntimeError) as exc:
+        db.check_compatibility()
+    msg = str(exc.value)
+    assert "rejected by the server during content negotiation" in msg
+    assert "pip install" in msg, "the message must say how to fix it"

@@ -38,8 +38,9 @@ These pieces are built once and consumed by both deployment models. Three are sm
 code touch-points; the artifact/manifest is the common contract; F5 and F6 are the gates and
 constraints that a session of building and rebuilding these stores showed were missing.
 
-**Status: F1–F4 are implemented** (`make_release.py`, `tests/test_make_release.py`);
-F5 and F6 are not. The stores this repo runs against were built by hand, and the hand-work is what
+**Status: F1–F6 are implemented** (`make_release.py`, `metadata_db.py`, `trapi_server.py`,
+`kg_query.py`, `tests/test_make_release.py`). What remains is the delivery layer — the
+scenario-1 updater/systemd units and the scenario-2 image/manifests below. The stores this repo runs against were built by hand, and the hand-work is what
 the plan encodes.
 
 **Fixed as part of F3: `kg_query.get_graph()` could not serve a release.** It hardcoded
@@ -161,21 +162,25 @@ from an aborted transaction fail every later cursor with `mdb_cursor_open: Inval
 Verified against a `chmod`-ed read-only directory: `readonly=True` serves it,
 `readonly=False` fails with `ReadonlyError: Permission denied`.
 
-### F5. Release gates (new — promote nothing that has not passed these)
+### F5. Release gates — **IMPLEMENTED**
 
 Two verification tools already exist and both earned their place by catching real regressions.
 `make_release.py` should run them against the candidate release and refuse to write
 `manifest.json` if either fails, so a bad build cannot become a release.
 
-1. **`probes/verify_variants.py` — store completeness.** Counts distinct `(s, p, o)` and
-   `(s, p, o, fingerprint)` in the source edges independently of the store, then compares.
-   This is what established that the old key was dropping 754,788 assertions, and what
-   confirmed LMDB, Elasticsearch and the source agreed at exactly 28,860,305. It needs the
-   extracted `edges.jsonl`, which `make_release.py` already has on hand mid-build — the
-   natural place to run it, rather than re-extracting 24 GB later.
+1. **Completeness (`--no-gate-completeness` to skip; on by default).** Recounts distinct
+   `(s, p, o)` and `(s, p, o, fingerprint)` straight from the archive and requires both stores
+   to match exactly. This is the check that established the old key was dropping 754,788
+   assertions. Implemented inside `make_release.py` over the archive stream rather than by
+   invoking `probes/verify_variants.py`, which needs a 24 GB extracted `edges.jsonl` the build
+   does not otherwise produce. Costs one extra streaming pass — instant on a sample graph,
+   minutes on the Translator KG. Uses a stable blake2b hash, not the builtin `hash()`, which
+   is salted per process and would make the gate's own numbers irreproducible.
 
-2. **`tests/test_corpus.py` — answer invariants.** Data-gated, skipped without a graph, so it
-   costs CI nothing and costs a release build one run. It asserts what actually regressed
+2. **Corpus invariants (`--gate-corpus`, opt-in).** Runs `tests/test_corpus.py` against the
+   staged release and refuses to publish on failure; skips cleanly when `trapi_corpus` is not
+   importable, since the HelmsDeep corpus lives outside this repo and only means anything on a
+   Translator-shaped graph. Data-gated, so it costs CI nothing and a release build one run. It asserts what actually regressed
    historically: no supported query shape returns zero, bindings satisfy their queried
    categories, `query_id` marks exactly the subclass-expanded nodes, and a capped result
    declares itself. Every accuracy regression in this project was caught by the corpus and by
@@ -184,7 +189,7 @@ Two verification tools already exist and both earned their place by catching rea
 Deliberately *not* a gate: absolute answer counts. They move whenever the graph is rebuilt,
 which would make the gate a tripwire for data changes rather than for defects.
 
-### F6. Elasticsearch deployment constraints (if the ES backend is used)
+### F6. Elasticsearch deployment constraints — **IMPLEMENTED**
 
 The release unit above is LMDB-only — an Elasticsearch index lives in a cluster, not in a
 directory, so it cannot be shipped as part of an immutable release dir. That has consequences
@@ -192,13 +197,17 @@ the plan has to state:
 
 - **The ES index must be reindexed in lockstep with a store-format change.** Document `_id` is
   `subject|predicate|object|fingerprint`; an index built by pre-version-2 code has collapsed
-  ids and is missing variants. `store_format_version` covers the LMDB store in the release dir
-  but *cannot* cover a cluster the release does not own — so an ES-backed deployment needs its
-  index version tracked separately, e.g. in the index name or an index-level metadata doc.
+  ids and is missing variants. Since the release directory cannot own a cluster, `build()` now
+  stamps `mappings._meta.csrgraph_store_format_version` into the index itself, and
+  `check_compatibility()` refuses a mismatch. An index predating the stamp reports `None` and
+  is tolerated, mirroring the unversioned-directory path.
 - **Client and server majors must match.** A 9.x Python client cannot talk to an 8.x server at
-  all (`Accept version must be either version 8 or 7, but found 9`), and mixing the other way
-  fails *partially* — `search` works while `count` returns 404, which produces wrong results
-  rather than an outage. Pin the client to the deployed server's major and assert it at startup.
+  all, and mixing the other way fails *partially* — `search` works while `count` returns 404,
+  which produces wrong results rather than an outage. `check_compatibility()` compares the two
+  and translates the server's content-negotiation error, which otherwise complains about media
+  types and never mentions versions, into a message naming the client to install.
+  `trapi_server` calls it at startup: a version mismatch is fatal for the same reason the
+  manifest one is, while an unreachable cluster is not, since LMDB alone can serve.
 - **`number_of_replicas` must be 0 on a single-node cluster**, or replica shards stay
   unassigned and cluster health goes yellow.
 - **Batching is load-bearing over a network.** A remote cluster measured a 28.85 ms pooled

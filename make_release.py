@@ -54,9 +54,25 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from csrgraph_kgx import CSRGraph
-from metadata_db import STORE_FORMAT_VERSION, LMDBMetadataBackend
+from metadata_db import (
+    STORE_FORMAT_VERSION,
+    LMDBMetadataBackend,
+    _stream_kgx,
+    qualifier_fingerprint,
+)
 
 _HASH_CHUNK = 1 << 20
+
+
+def _h64(text: str) -> int:
+    """Stable 64-bit hash.
+
+    Deliberately not the builtin ``hash()``: that is salted per process, so a
+    release gate using it would report numbers that could not be reproduced by a
+    second run. Cardinality would be unaffected, but a gate whose output is not
+    reproducible is a gate nobody can check.
+    """
+    return int.from_bytes(hashlib.blake2b(text.encode(), digest_size=8).digest(), "big")
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +168,78 @@ def _build_lmdb(archive: Path, dest: Path, node_fields: list[str],
     print(f"      {variants:,} edge variants ({time.perf_counter() - t0:.0f}s)",
           flush=True)
     return variants
+
+
+def _gate_completeness(archive: Path, distinct: int, variants: int) -> None:
+    """F5: count the source independently and require the stores to match it.
+
+    The bound in :func:`_verify` is a sanity check between two numbers the build
+    itself produced; this derives the truth from the archive again and compares.
+    It is what established that the pre-version-2 key was dropping 754,788
+    assertions, and what confirmed LMDB, Elasticsearch and the source agreeing at
+    exactly 28,860,305.
+
+    Costs one extra streaming pass over the archive — minutes on the Translator
+    KG, instant on a sample graph. 64-bit hashes are kept rather than keys: 29M
+    ``uint64`` is 231 MB where 29M Python strings in a set would be several GB,
+    and at that scale a collision has probability ~2e-5.
+    """
+    print("      gate: recounting the source ...", flush=True)
+    t0 = time.perf_counter()
+    tri: set[int] = set()
+    var: set[int] = set()
+    for kind, rec in _stream_kgx(str(archive)):
+        if kind != "edge":
+            continue
+        spo = f"{rec['subject']}|{rec['predicate']}|{rec['object']}"
+        tri.add(_h64(spo))
+        var.add(_h64(f"{spo}|{qualifier_fingerprint(rec)}"))
+    print(f"      source has {len(tri):,} distinct triples, {len(var):,} variants "
+          f"({time.perf_counter() - t0:.0f}s)", flush=True)
+
+    if len(tri) != distinct:
+        raise SystemExit(
+            f"refusing to publish: the archive holds {len(tri):,} distinct triples "
+            f"but the graph holds {distinct:,}. The CSR snapshot is not a faithful "
+            "copy of the source."
+        )
+    if len(var) != variants:
+        raise SystemExit(
+            f"refusing to publish: the archive holds {len(var):,} edge variants but "
+            f"the metadata store holds {variants:,}. "
+            + ("The store is dropping assertions — the symptom of a store built "
+               "with a key that ignores qualifiers." if variants < len(var)
+               else "The store has more records than the source, which cannot happen.")
+        )
+
+
+def _gate_corpus(release_dir: Path, graph_name: str) -> None:
+    """F5: run the data-gated corpus invariants against the staged release.
+
+    Skips cleanly when ``trapi_corpus`` is not importable, since the HelmsDeep
+    corpus lives outside this repo and only means anything on a
+    Translator-shaped graph. When it does run it is the strongest gate available:
+    every accuracy regression in this project's history was caught by the corpus
+    and by nothing else.
+    """
+    import subprocess
+
+    try:
+        import trapi_corpus  # noqa: F401
+    except ImportError:
+        print("      gate: corpus skipped (trapi_corpus not importable)", flush=True)
+        return
+    print("      gate: corpus invariants ...", flush=True)
+    env = {**os.environ, "DATA_DIR": str(release_dir), "GRAPH_NAME": graph_name}
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q",
+         str(Path(__file__).resolve().parent / "tests" / "test_corpus.py")],
+        env=env, capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-15:])
+        raise SystemExit(f"refusing to publish: corpus gate failed\n{tail}")
+    print(f"      {proc.stdout.strip().splitlines()[-1]}", flush=True)
 
 
 def _verify(lmdb_dir: Path, graph_path: Path, distinct: int, records: int,
@@ -259,6 +347,10 @@ def main() -> None:
                     help="comma-separated, or 'all' (default)")
     ap.add_argument("--skip-verify", action="store_true",
                     help="skip the readability check (not recommended)")
+    ap.add_argument("--no-gate-completeness", action="store_true",
+                    help="skip recounting the archive (saves one streaming pass)")
+    ap.add_argument("--gate-corpus", action="store_true",
+                    help="also run tests/test_corpus.py against the staged release")
     ap.add_argument("--force", action="store_true",
                     help="replace an existing release of this version")
     a = ap.parse_args()
@@ -289,6 +381,10 @@ def main() -> None:
                                fields(a.edge_metadata_fields))
         if not a.skip_verify:
             _verify(lmdb_dir, graph_path, distinct, records, variants)
+        if not a.no_gate_completeness:
+            _gate_completeness(archive, distinct, variants)
+        if a.gate_corpus:
+            _gate_corpus(stage, a.graph_name)
 
         manifest = _manifest(
             graph_name=a.graph_name, version=a.version, archive=archive,

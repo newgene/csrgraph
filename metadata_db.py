@@ -1914,6 +1914,73 @@ class ElasticsearchMetadataBackend(MetadataBackend):
         self._nodes_idx = f"{index_prefix}_nodes"
         self._edges_idx = f"{index_prefix}_edges"
 
+    def check_compatibility(self) -> dict:
+        """Verify this client can trust this cluster's indices. Call at startup.
+
+        Two independent mismatches, both of which fail in ways that look like
+        something else:
+
+        **Client and server major.** A 9.x client cannot talk to an 8.x server at
+        all (``Accept version must be either version 8 or 7, but found 9``).
+        Mixing the other way is worse: an 8.x client against a 9.x server has
+        ``search`` succeed while ``count`` returns 404, so results come back
+        *partially* wrong rather than failing.
+
+        **Index store format.** A version-1 edge index keyed ``_id`` on the triple
+        alone, so qualifier variants overwrote one another. Querying it with
+        version-2 code returns answers — just fewer than exist, silently.
+
+        Deliberately not called from ``__init__``: it costs two round trips, which
+        against a remote cluster is ~60 ms on every backend construction. It
+        belongs at the startup gate, next to the manifest check.
+        """
+        import elasticsearch
+
+        client_major = int(elasticsearch.__version__[0])
+        try:
+            server = self._es.info()["version"]["number"]
+        except Exception as exc:
+            # A newer client is refused by the server during content negotiation,
+            # with a message about media types that says nothing about the actual
+            # problem.  Translate it.
+            if "media_type" in str(exc) or "Accept version" in str(exc):
+                raise RuntimeError(
+                    f"Elasticsearch client major {client_major} was rejected by the "
+                    f"server during content negotiation: it accepts only older "
+                    f"majors. Install a client matching the deployed server "
+                    f"(pip install 'elasticsearch>={client_major - 1},"
+                    f"<{client_major}')."
+                ) from exc
+            raise
+        server_major = int(server.split(".")[0])
+        if client_major != server_major:
+            raise RuntimeError(
+                f"Elasticsearch client major {client_major} against server {server}. "
+                "These are not interoperable: a newer client is rejected outright, "
+                "and an older one fails per-API (search works, count 404s) so "
+                "results come back partially wrong. Pin the client to the server's "
+                "major."
+            )
+
+        found: dict[str, object] = {}
+        for idx in (self._nodes_idx, self._edges_idx):
+            try:
+                mapping = self._es.indices.get_mapping(index=idx)
+                meta = mapping[idx]["mappings"].get("_meta") or {}
+            except Exception:
+                meta = {}
+            version = meta.get("csrgraph_store_format_version")
+            found[idx] = version
+            if version is not None and version != STORE_FORMAT_VERSION:
+                raise RuntimeError(
+                    f"index {idx} was built with store format {version}, but this "
+                    f"code reads {STORE_FORMAT_VERSION}. Reindex it: a format-1 "
+                    "edge index collapsed qualifier variants into one document, so "
+                    "queries would silently return fewer answers than exist."
+                )
+        return {"client": elasticsearch.__version__, "server": server,
+                "index_store_format": found}
+
     def close(self) -> None:
         self._es.close()
 
@@ -1983,10 +2050,22 @@ class ElasticsearchMetadataBackend(MetadataBackend):
                 mapping = {**mapping, "settings": settings}
             if es.indices.exists(index=idx):
                 es.indices.delete(index=idx)
+            # Stamp the store format into the index's own metadata.  A release
+            # directory carries manifest.json, but an Elasticsearch index lives in
+            # a cluster the release does not own, so it has to describe itself or
+            # nothing can tell a version-1 index (collapsed _ids, missing
+            # variants) from a version-2 one.
+            mappings = {
+                **(mapping.get("mappings") or {}),
+                "_meta": {
+                    "csrgraph_store_format_version": STORE_FORMAT_VERSION,
+                    "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                },
+            }
             es.indices.create(
                 index=idx,
                 settings=mapping.get("settings"),
-                mappings=mapping.get("mappings"),
+                mappings=mappings,
             )
             # Suspend refreshes for the bulk load.  At the default 1s interval a
             # multi-million-document build pays continuous segment creation and
