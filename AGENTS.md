@@ -129,6 +129,58 @@ interactive network graph plus grouped tables:
     --to-category biolink:DiseaseOrPhenotypicFeature --max-hops 2 --out report.html
 ```
 
+## Building a deployable release
+
+`make_release.py` packages a KGX archive into an immutable, self-describing
+release directory — the unit a deployment consumes:
+
+```bash
+.venv/bin/python make_release.py ~/tmp/csrgraph_data/dgidb.tar.zst \
+    --version 2026-08-14 --graph-name dgidb --out-root ~/tmp/releases
+```
+
+```
+2026-08-14/
+  dgidb.csrgraph.pkl.zst
+  dgidb.csrgraph.memmap/      # optional; --no-memmap skips it
+  dgidb.metadata.lmdb/
+  manifest.json               # written last
+```
+
+Everything is built in a staging directory and moved into place with one
+`os.replace`, so a release appears atomically or not at all. This matters beyond
+tidiness: `LMDBMetadataBackend.build()` starts by `rmtree`-ing its target, so a
+build aimed at a live directory would destroy the running store before producing
+a replacement.
+
+Before publishing it recounts the archive and refuses to publish if the stores do
+not match (`--no-gate-completeness` to skip the extra pass; `--gate-corpus` to
+also run `tests/test_corpus.py` against the candidate).
+
+`manifest.json` carries `store_format_version`, which is **not cosmetic**: edge
+metadata is keyed `(subject, predicate, object, qualifier_fingerprint)`, and a
+store built before that key is *silently* unreadable by current code — prefix
+scans match nothing, so qualifier-constrained queries return empty with no error.
+`trapi_server.py` reads the manifest at startup and **refuses to serve** on a
+mismatch; `GET /version` reports the deployed release and readiness. A directory
+without a manifest still works, unchecked, so hand-built stores keep serving.
+
+Serve a release with the store it ships:
+
+```bash
+DATA_DIR=~/tmp/releases/2026-08-14 GRAPH_NAME=dgidb NO_ES=1 \
+    .venv/bin/python trapi_server.py
+```
+
+`kg_query.get_graph()` takes `backend="auto"|"lmdb"|"es"` and defaults to `auto`,
+preferring the LMDB store when the directory has one. `resolve`/`resolve_one`
+still need `backend="es"` — full-text lookup has no LMDB equivalent. Serving
+opens LMDB read-only, so a release directory is never mutated and read-only
+mounts work.
+
+Plan and remaining work: `docs/production-release-plan.md` (F1–F6 implemented;
+the delivery layer is not).
+
 ## Tests
 
 ```bash

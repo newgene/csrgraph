@@ -23,10 +23,16 @@ htmlcov/
 
 # Generated graph / metadata stores
 *.lmdb/
+*.memmap/
 *.sqlite
 *.duckdb
 *.pkl
 *.pkl.zst
+
+# Release directories from make_release.py.  The stores and snapshots inside are
+# already covered above, but the memmap dir and manifest.json are not, so a
+# release built with --out-root inside the repo would leave those visible.
+/releases/
 
 # Generated query output / scratch
 csr_test_result.json
