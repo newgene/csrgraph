@@ -153,7 +153,12 @@ def display_query_graph(query_graph: dict) -> str:
     qedges = query_graph["edges"]
 
     def _node_label(nk: str) -> str:
-        qn = qnodes[nk]
+        # Tolerate an edge naming a node the graph does not define.  This is a
+        # debug visualiser and the server logs it *before* the query runs, so
+        # raising here crashed the request ahead of validation — a malformed
+        # query graph came back as an unhandled 500 instead of the 400 that
+        # _validate_query_graph produces.
+        qn = qnodes.get(nk) or {}
         parts = [nk]
         ids = qn.get("ids")
         if ids:

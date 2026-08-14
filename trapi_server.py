@@ -36,6 +36,7 @@ import argparse
 import os
 import sys
 import time
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -875,22 +876,37 @@ async def trapi_query(
         )
     limit = max(1, min(limit, _MAX_LIMIT))
 
-    # Log the query to stdout.
-    print(f"\n--- TRAPI query (limit={limit}) ---")
-    print(display_query_graph(query_graph))
-
     t0 = time.time()
     try:
+        # Logging is inside the try: rendering the query graph reads it, so a
+        # malformed one must not escape the handler before validation runs.
+        print(f"\n--- TRAPI query (limit={limit}) ---")
+        print(display_query_graph(query_graph))
+
         # Run the synchronous, CPU/IO-heavy query off the event loop so it
         # does not block other requests (incl. /health).
         result_message = await run_in_threadpool(
             query, _graph, query_graph, limit=limit
         )
-    except Exception as exc:
-        print(f"  -> query failed: {type(exc).__name__}: {exc}")
+    except ValueError as exc:
+        # trapi._validate_query_graph raises ValueError for a query graph that is
+        # well-formed JSON but not a valid graph — an edge naming a node that
+        # does not exist, or the Pathfinder 'paths' shape.  That is the client's
+        # error, and the message names the offending element.
+        print(f"  -> invalid query graph: {exc}")
         return JSONResponse(
             status_code=400,
-            content={"error": "query failed", "detail": str(exc)},
+            content={"error": "invalid query graph", "detail": str(exc)},
+        )
+    except Exception as exc:
+        # Anything else is a fault on our side.  Reporting these as 400 told
+        # callers their request was bad when the server had failed, which also
+        # hides real breakage from anything alerting on 5xx.
+        traceback.print_exc()
+        print(f"  -> query failed: {type(exc).__name__}: {exc}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal error", "detail": str(exc)},
         )
     elapsed_ms = (time.time() - t0) * 1000
 
