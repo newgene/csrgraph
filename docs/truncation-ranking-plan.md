@@ -139,6 +139,16 @@ Three checks, in order of strength:
   in particular namespaces or categories, median imputation is not neutral. Worth
   measuring coverage by category before trusting it.
 
+## Sequencing note (added 2026-08-14)
+
+`docs/general-match-rewrite-plan.md` phase 2 moves `_general_match` into index
+space, which changes truncation ordering in that matcher from alphabetical-by-CURIE
+to ingest order — arbitrary either way. **If ranking lands first, that phase
+becomes ordering-neutral**, because ordering would be explicit rather than
+incidental, and callers see one change instead of two. That is the only argument
+for doing this work before the rewrite; on its own merits it is still the lower
+priority of the two.
+
 ## Honest priority
 
 This is the **lowest-value** item on the current list. Truncation now reports
