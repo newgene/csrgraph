@@ -326,14 +326,16 @@ earlier backend benchmarks.
 
 ## Remaining work
 
-1. **Emit `query_id` on subclass-expanded node bindings**, and **re-check expanded
-   nodes against the query node's `categories`** (a Disease query currently returns
-   `HP:` phenotype nodes). Together these account for every csr-only answer.
+*Superseded — see the dated sections below for what was done. Items 1 and 3 are
+complete; the current open list is at the end of this document.*
+
+1. ~~Emit `query_id` on subclass-expanded node bindings, and re-check expanded
+   nodes against the query node's `categories`.~~ Done.
 2. **Push constraints into enumeration, or raise the default `limit`.** The
-   filter-after-cap behaviour silently under-answers constrained queries.
-3. Surface truncation in TRAPI `message.logs` (it currently only warns).
+   filter-after-cap behaviour silently under-answers constrained queries. Still open.
+3. ~~Surface truncation in TRAPI `message.logs`.~~ Done.
 4. Split 400 vs 500 in `trapi_server.py`; put the corpus in CI behind a
-   data-gated skip.
+   data-gated skip. Still open.
 
 ---
 
@@ -614,3 +616,47 @@ endpoint, anchored on the set of nodes `match_path` actually started from
 subclass `query_id` representation shared with every other differing row —
 `match_path` expands a pinned start node where `_general_match` did not, so this
 query now behaves like the rest. Every other corpus row is unchanged.
+
+
+---
+
+## Open items as of 2026-08-13
+
+Accuracy against gandalf is settled: four corpus queries are byte-identical, and
+every remaining difference is the subclass `query_id` representation, which is a
+deliberate choice rather than a defect.
+
+### Correctness
+
+1. **Constraints are applied after the `limit` cap.** `limit` means "examine N
+   paths, return however many survive", not "return N answers", so a constrained
+   query silently under-answers. This produced the whole MVP2 gap (137 answers at
+   `limit=200` against 979 at `limit=5000`). Truncation is now reported in
+   `message.logs`, but the semantics are still surprising. Fix by pushing
+   constraints into enumeration, or by raising the default from 100.
+2. **`trapi_server.py` returns 400 for everything.** The `except Exception` around
+   the query returns `status_code=400`, so an internal fault is reported as a
+   client error. Malformed input is already rejected earlier by
+   `_validate_query_graph`, so this handler should be 500.
+
+### Quality
+
+3. **Truncated results are alphabetical.** Determinism is fixed, but the kept
+   subset is now "whichever CURIEs sort first", which is reproducible rather than
+   defensible. Ranking (degree, knowledge level) would make truncation meaningful.
+4. **`_get_edge_neighbors` still gathers reverse neighbours for all predicates**
+   when any is symmetric, the same per-hop leak fixed elsewhere. Contained —
+   `_matching_predicates` rejects the extras, verified 0 results — so it is wasted
+   work in the general matcher, not a wrong answer.
+5. **The corpus is not in CI.** It needs the full graph, so it would have to be
+   data-gated. Every accuracy regression in this session was caught by it and by
+   nothing else.
+6. **`_general_match` is still string-keyed.** The durable fix for the
+   determinism class of bug is keeping it in index space, as gandalf does.
+
+### Deployment
+
+7. **`docs/production-release-plan.md` is entirely unimplemented** — F1 release
+   packaging, F2 manifest, F3 `/version` endpoint, F4 read-only LMDB open, plus
+   both deployment scenarios. This is the largest single body of remaining work
+   and nothing in it has been started.
