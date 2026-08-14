@@ -1363,3 +1363,81 @@ class TestTruncationLogs:
         assert len(msg["results"]) == 2
         assert msg["logs"][0]["code"] == "ResultsTruncated"
         assert msg["logs"][0]["level"] == "WARNING"
+
+
+class TestSymmetricHops:
+    """Symmetric predicates are matched on the vectorized path, both ways.
+
+    Biolink declares 39 predicates symmetric, and for those an assertion stored
+    one way answers a query posed the other way. These queries used to divert to
+    ``_general_match``, which costs an order of magnitude (26.7 s against 0.33 s
+    on the HelmsDeep two_hop_lookup shape). ``match_path`` now takes a hop
+    direction of ``None`` and walks both ways.
+    """
+
+    @pytest.fixture(scope="class")
+    def graph(self):
+        from csrgraph_kgx import CSRGraph
+
+        # Only ONE stored orientation for each pair, so a query posed the other
+        # way can only succeed if both directions are walked.
+        return CSRGraph([
+            ("C:1", "biolink:interacts_with", "C:2"),
+            ("C:3", "biolink:interacts_with", "C:1"),
+            ("C:1", "biolink:treats", "D:1"),
+        ])
+
+    def _ask(self, g, subj, obj, predicate="biolink:interacts_with"):
+        from trapi import query
+
+        g.set_db(_StubDB())
+        qg = {"nodes": {"n0": {"ids": [subj]}, "n1": {"ids": [obj]}},
+              "edges": {"e0": {"subject": "n0", "object": "n1",
+                               "predicates": [predicate]}}}
+        msg = query(g, qg, limit=10, node_subclassing=False)
+        edges = msg["knowledge_graph"]["edges"]
+        return len(msg["results"]), [
+            (e["subject"], e["object"]) for e in edges.values()
+        ]
+
+    def test_matches_in_stored_direction(self, graph):
+        n, orient = self._ask(graph, "C:1", "C:2")
+        assert n == 1 and orient == [("C:1", "C:2")]
+
+    def test_matches_against_stored_direction(self, graph):
+        """The whole point: C:3 -> C:1 answers a query for C:1 -> C:3."""
+        n, orient = self._ask(graph, "C:1", "C:3")
+        assert n == 1, "symmetric predicate not matched against its stored direction"
+        # The knowledge graph must still report the edge as it is stored.
+        assert orient == [("C:3", "C:1")]
+
+    def test_asymmetric_predicate_still_one_way(self, graph):
+        """Only symmetric predicates get this treatment."""
+        assert self._ask(graph, "C:1", "D:1", "biolink:treats")[0] == 1
+        assert self._ask(graph, "D:1", "C:1", "biolink:treats")[0] == 0
+
+    def test_symmetric_hop_unions_both_directions(self, graph):
+        """match_path with a None hop returns forward and reverse together."""
+        graph.set_db(_StubDB())
+        spec = ["C:1", "biolink:interacts_with", None]
+        fwd = graph.match_path(spec, limit=10, hop_directions=[True])
+        rev = graph.match_path(spec, limit=10, hop_directions=[False])
+        both = graph.match_path(spec, limit=10, hop_directions=[None])
+        assert {p[0] for p in fwd} == {("C:1", "biolink:interacts_with", "C:2")}
+        assert {p[0] for p in rev} == {("C:3", "biolink:interacts_with", "C:1")}
+        assert {p[0] for p in both} == {p[0] for p in fwd} | {p[0] for p in rev}
+
+    def test_both_orientations_stored_yields_one_path(self):
+        """A pair asserted both ways under one symmetric predicate is one answer."""
+        from csrgraph_kgx import CSRGraph
+
+        g = CSRGraph([
+            ("C:1", "biolink:interacts_with", "C:2"),
+            ("C:2", "biolink:interacts_with", "C:1"),
+        ])
+        g.set_db(_StubDB())
+        paths = g.match_path(["C:1", "biolink:interacts_with", None],
+                             limit=10, hop_directions=[None])
+        assert len(paths) == 1, f"duplicate assertion emitted twice: {paths}"
+        # Forward is walked first, so its orientation is the one kept.
+        assert paths[0][0] == ("C:1", "biolink:interacts_with", "C:2")

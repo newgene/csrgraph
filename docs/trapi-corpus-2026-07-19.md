@@ -489,3 +489,81 @@ Determinism makes the arbitrary choice *reproducible*, not *good*: the kept subs
 is now the alphabetically-first CURIEs. Two independent follow-ups remain —
 applying constraints during enumeration so `limit` means "N answers" rather than
 "N paths examined", and ranking before truncating so the kept subset is defensible.
+
+---
+
+## Symmetric predicates on the vectorized path — 2026-08-13
+
+csrgraph already *supported* symmetric predicates: `query()` detected them and
+routed to `_general_match`, which searches both directions. Verified against a
+stored edge `CHEBI:100147 -interacts_with-> CHEBI:100241` — querying either way
+returned the edge. And `two_hop_lookup`, the only symmetric corpus query, was
+already answer-set identical to gandalf.
+
+So symmetry was never an accuracy gap. Attribution of the remaining corpus
+differences, per query node:
+
+| qtype | node | csr-only | of which subclass-expanded | symmetric? |
+| --- | --- | --- | --- | --- |
+| `one_hop_lookup_open` | n1 | 1 | 1 | False |
+| `one_hop_no_predicate` | n1 | 3 | 3 | False |
+| `batch_lookup` | n1 | 27 | 27 | False |
+| `mvp1_heavy` | n1 | 1 | 1 | False |
+| `mvp1_medium` | n1 | 1 | 1 | False |
+| `mvp1_light` | n1 | 2 | 2 | False |
+
+**35 of 35** csr-only answers are subclass-expanded bindings carrying `query_id`,
+and none of those queries uses a symmetric predicate.
+
+### It was a performance gap instead
+
+A single symmetric predicate anywhere in the query graph dropped the whole query
+off the fast path, losing vectorized expansion, batched metadata filtering, and
+reachability pruning. Measured on the `two_hop_lookup` shape:
+
+| Path | Time |
+| --- | --- |
+| `match_path` (vectorized) | **0.33 s** |
+| `_general_match` (what ran) | 26.7 s |
+| gandalf | 3.5 s |
+
+That was the entire explanation for the one benchmark gandalf won.
+
+`match_path` now accepts a hop direction of `None`, meaning symmetric: it walks
+both ways and unions the results, tagging each candidate with the direction it
+came from so emitted edges keep their true stored orientation. `_linear_query`
+sets `None` for hops whose predicates include a symmetric one — reviving a
+`symmetric_edges` dict that had been computed and never read — and `query()` no
+longer diverts. `_general_match` keeps its own symmetric handling for branching
+and cyclic queries.
+
+### Result
+
+`two_hop_lookup`, at a limit high enough not to truncate:
+
+| | before | after | gandalf |
+| --- | --- | --- | --- |
+| time | 26,665 ms | **2,336 ms** | 3,461 ms |
+| `n0` / `n1` | 12,892 / 547 | 12,892 / 547 | 12,892 / 547 |
+
+Answer sets unchanged and identical to gandalf; csrgraph is now **faster than
+gandalf** on the query it previously lost by 8×. Every other corpus row is
+byte-identical. The remaining `n2` difference (7 vs 1) is the same subclass
+`query_id` representation as every other row — `match_path` expands a pinned
+start node where `_general_match` did not, so this query now behaves like the
+rest.
+
+### Two things found on the way
+
+* **A latent aliasing bug.** Each direction's `_mp_expand_frontier` returns its
+  own `labels` sequence. Keeping the relation *index* and resolving it after the
+  loop read forward-walk indices against reverse-walk labels. Predicates are now
+  resolved at collection time.
+* **Symmetric walks enumerate more paths for the same answers** — 129,186 against
+  72,478 here, because this graph stores both `condition_associated_with_gene`
+  and `gene_associated_with_condition` for the same pairs. Those are genuinely
+  distinct edges, so both are kept; only an identical `(pair, predicate)` reached
+  both ways is deduplicated. The practical consequence is that a symmetric query
+  hits a fixed `limit` sooner: at `limit=100000` this query truncated to 43,292
+  results and 309 genes, which the `ResultsTruncated` log now reports. Raising the
+  limit recovers the full 547.

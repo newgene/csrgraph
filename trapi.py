@@ -265,28 +265,23 @@ def query(
         query_graph = expand_query_graph(query_graph, expander)
         qedges = query_graph["edges"]
 
-    # Check if any edge uses symmetric predicates (needs bidirectional search).
-    has_symmetric = any(
-        any(p in SYMMETRIC_PREDICATES for p in qe.get("predicates", []))
-        for qe in qedges.values()
-    )
-
-    # Fast path: try to linearise into a chain for match_path().
-    # Falls back to general matcher for non-linear or symmetric queries.
-    if has_symmetric:
+    # Fast path: linearise into a chain for match_path().  Symmetric predicates
+    # used to divert here to the general matcher; match_path now walks a
+    # symmetric hop both ways itself, which matters because the backtracking
+    # matcher is an order of magnitude slower on the same shape (26.7 s against
+    # 0.33 s on the HelmsDeep two_hop_lookup).  The general matcher still owns
+    # branching and cyclic queries, and keeps its own symmetric handling.
+    try:
+        ordered_node_keys, ordered_edge_keys, hop_dirs = _linearise(
+            qnodes, qedges
+        )
+        bindings, truncated = _linear_query(
+            graph, qnodes, qedges, ordered_node_keys, ordered_edge_keys, limit,
+            hop_dirs, node_subclassing, subclass_depth,
+        )
+    except ValueError:
+        # Branching or cyclic — use the general subgraph matcher.
         bindings, truncated = _general_match(graph, qnodes, qedges, limit)
-    else:
-        try:
-            ordered_node_keys, ordered_edge_keys, hop_dirs = _linearise(
-                qnodes, qedges
-            )
-            bindings, truncated = _linear_query(
-                graph, qnodes, qedges, ordered_node_keys, ordered_edge_keys, limit,
-                hop_dirs, node_subclassing, subclass_depth,
-            )
-        except ValueError:
-            # Branching or cyclic — use the general subgraph matcher.
-            bindings, truncated = _general_match(graph, qnodes, qedges, limit)
 
     # Post-filter pipeline: subclass validation → node constraints →
     # edge attributes → qualifiers.
@@ -338,12 +333,17 @@ def _linear_query(
         if preds and len(preds) > 1:
             multi_pred_edges[hop_idx] = set(preds)
 
-    # Collect which edges use symmetric predicates (search both directions).
-    symmetric_edges: dict[int, bool] = {}
-    for hop_idx, ek in enumerate(ordered_edge_keys):
-        preds = qedges[ek].get("predicates") or []
-        if any(p in SYMMETRIC_PREDICATES for p in preds):
-            symmetric_edges[hop_idx] = True
+    # Symmetric predicates are direction-free: an assertion stored one way
+    # answers a query posed the other way.  ``None`` tells match_path to walk
+    # that hop both ways.  This dict was previously computed and never read.
+    if hop_directions is not None:
+        hop_directions = [
+            None
+            if any(p in SYMMETRIC_PREDICATES
+                   for p in (qedges[ek].get("predicates") or []))
+            else fwd
+            for fwd, ek in zip(hop_directions, ordered_edge_keys)
+        ]
 
     bindings: list[Binding] = []
     truncated = False
