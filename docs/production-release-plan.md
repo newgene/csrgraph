@@ -38,10 +38,20 @@ These pieces are built once and consumed by both deployment models. Three are sm
 code touch-points; the artifact/manifest is the common contract; F5 and F6 are the gates and
 constraints that a session of building and rebuilding these stores showed were missing.
 
-**Status: none of F1–F6 is implemented.** The stores this repo runs against were built by
-hand, and the hand-work is what the plan encodes.
+**Status: F1 and F2 are implemented** (`make_release.py`, `tests/test_make_release.py`);
+F3–F6 are not. The stores this repo runs against were built by hand, and the hand-work is what
+the plan encodes.
 
-### F1. Release packaging step (new script: `make_release.py`)
+**Found while testing F1's output: `kg_query.get_graph()` cannot serve a release.** It
+hardcodes `ElasticsearchMetadataBackend(es_host, index_prefix=name)` with no LMDB option and no
+fallback, so pointing it at a release directory yields a graph whose topology loads and whose
+every metadata lookup fails against a nonexistent index — `neighbors()` works, `get_edge()`
+returns `{}`. A release ships an LMDB store, not an ES index, so this is a real gap in the
+serving path and belongs to F3: the server should prefer the release's own LMDB. `trapi_server.py`
+is unaffected and already correct — with `NO_ES=1` it serves a release directly, verified
+end-to-end returning results with metadata from the release's own store.
+
+### F1. Release packaging step (`make_release.py`) — **IMPLEMENTED**
 Produce an **immutable release directory** from a KGX archive, reusing existing builders.
 
 **Build into a temporary directory and move it into place only once complete.**
@@ -74,7 +84,7 @@ Output layout (the unit that gets shipped/promoted):
   manifest.json
 ```
 
-### F2. Manifest format (`manifest.json`)
+### F2. Manifest format (`manifest.json`) — **IMPLEMENTED**
 The version/integrity contract the upstream publishes and consumers compare against:
 ```json
 {
@@ -83,6 +93,8 @@ The version/integrity contract the upstream publishes and consumers compare agai
   "built_at": "2026-06-10T12:00:00Z",
   "source_kgx": "translator_kg_2026-06-08.tar.zst",
   "store_format_version": 2,
+  "source_sha256": "...",
+  "source_bytes": 0,
   "artifacts": {
     "pkl_zst": {"path": "...", "sha256": "...", "bytes": 0},
     "memmap":  {"sha256_tree": "...", "bytes": 0},
@@ -100,10 +112,26 @@ serve** on mismatch rather than answering queries with silently empty results (s
 Context note). Bump it whenever a key layout changes — the qualifier-fingerprint re-key is
 version 2.
 
-`variant_count` (distinct `(s, p, o, fingerprint)`) is recorded separately from `edge_count`
-(distinct `(s, p, o)`) because they differ — 28,860,305 against 28,105,517 on this graph —
-and a release whose variant count collapses to the triple count is one built by pre-version-2
-code. That single number catches the regression that cost 754,788 assertions here.
+**Three edge counts, all different, and conflating them is a live trap.** The manifest records
+all three:
+
+| field | meaning | dgidb | 2026-07-19 |
+| --- | --- | --- | --- |
+| `source_record_count` | raw edge records in the archive | 52,065 | 28,925,258 |
+| `edge_count` | distinct `(s, p, o)` — what the CSR holds | 51,943 | 28,105,517 |
+| `variant_count` | distinct `(s, p, o, fingerprint)` — what LMDB holds | 52,065 | 28,860,305 |
+
+Note `CSRGraph.edge_count` is `len(normalized_triples)`, the **raw record count**, *not* the
+distinct-triple count its name suggests; the distinct figure is the sum of the per-predicate
+matrices' `nnz`. A completeness check written against the wrong one is wrong in a way that
+looks right: `variant_count < CSRGraph.edge_count` is *normal*, because duplicate records with
+identical qualifiers collapse, so that check would have refused to publish the real Translator
+release (28,860,305 < 28,925,258). The implemented bound is two-sided —
+`edge_count <= variant_count <= source_record_count`.
+
+A release whose `variant_count` has collapsed to `edge_count` on a graph known to contain
+qualifier duplicates is one built by pre-version-2 code; that single number catches the
+regression that cost 754,788 assertions here.
 Published to object storage (S3/GCS/HTTPS) as the **last, atomic** step of an upstream build so
 no consumer ever sees a half-written manifest. This is the single source both scenarios poll.
 

@@ -1,0 +1,190 @@
+"""F1/F2 release packaging — data-free, using a tiny synthetic KGX archive.
+
+Covers the properties a consumer depends on: the release appears atomically or
+not at all, the manifest describes it accurately, and the three edge counts stay
+distinct from one another.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import subprocess
+import sys
+import tarfile
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import make_release  # noqa: E402
+from metadata_db import STORE_FORMAT_VERSION  # noqa: E402
+from tests.test_synthetic import _zstd_compress  # noqa: E402
+
+# One triple asserted twice with different qualifiers, plus a second triple.
+# So: 3 records, 2 distinct triples, 3 variants — the three counts the manifest
+# keeps separate, all different from each other.
+_NODES = [
+    {"id": "CHEBI:V", "name": "DrugV", "category": ["biolink:SmallMolecule"]},
+    {"id": "NCBIGene:V", "name": "GeneV", "category": ["biolink:Gene"]},
+]
+_EDGES = [
+    {"subject": "CHEBI:V", "predicate": "biolink:affects", "object": "NCBIGene:V",
+     "object_direction_qualifier": "increased"},
+    {"subject": "CHEBI:V", "predicate": "biolink:affects", "object": "NCBIGene:V",
+     "object_direction_qualifier": "decreased"},
+    {"subject": "CHEBI:V", "predicate": "biolink:treats", "object": "NCBIGene:V"},
+]
+
+
+@pytest.fixture
+def archive(tmp_path: Path) -> Path:
+    nb = ("\n".join(json.dumps(n) for n in _NODES)).encode()
+    eb = ("\n".join(json.dumps(e) for e in _EDGES)).encode()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, data in [("nodes.jsonl", nb), ("edges.jsonl", eb)]:
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tar.addfile(ti, io.BytesIO(data))
+    p = tmp_path / "kg.tar.zst"
+    p.write_bytes(_zstd_compress(buf.getvalue()))
+    return p
+
+
+def _run(archive: Path, out_root: Path, *extra: str):
+    return subprocess.run(
+        [sys.executable, str(ROOT / "make_release.py"), str(archive),
+         "--version", "v1", "--graph-name", "kg", "--out-root", str(out_root),
+         *extra],
+        capture_output=True, text=True, cwd=str(ROOT),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hashing
+# ---------------------------------------------------------------------------
+
+def test_tree_hash_is_stable(tmp_path: Path):
+    d = tmp_path / "t"
+    (d / "sub").mkdir(parents=True)
+    (d / "a.bin").write_bytes(b"one")
+    (d / "sub" / "b.bin").write_bytes(b"two")
+    assert make_release._sha256_tree(d) == make_release._sha256_tree(d)
+
+
+def test_tree_hash_covers_layout_not_just_bytes(tmp_path: Path):
+    """Renaming a file must change the digest.
+
+    Without the path in the digest, two trees holding the same file *contents*
+    under different names would hash identically, and a release with a misplaced
+    artifact would verify clean.
+    """
+    a, b = tmp_path / "a", tmp_path / "b"
+    for d in (a, b):
+        d.mkdir()
+    (a / "x.bin").write_bytes(b"same")
+    (b / "y.bin").write_bytes(b"same")
+    assert make_release._sha256_tree(a)[1] == make_release._sha256_tree(b)[1]  # same bytes
+    assert make_release._sha256_tree(a)[0] != make_release._sha256_tree(b)[0]  # different digest
+
+
+# ---------------------------------------------------------------------------
+# Packaging
+# ---------------------------------------------------------------------------
+
+def test_release_is_published_with_an_accurate_manifest(archive: Path, tmp_path: Path):
+    out = tmp_path / "releases"
+    r = _run(archive, out)
+    assert r.returncode == 0, r.stderr
+
+    rel = out / "v1"
+    manifest = json.loads((rel / "manifest.json").read_text())
+
+    assert manifest["graph_name"] == "kg"
+    assert manifest["version"] == "v1"
+    assert manifest["store_format_version"] == STORE_FORMAT_VERSION
+
+    # The three counts are genuinely different, and each means what it says.
+    assert manifest["node_count"] == 2
+    assert manifest["edge_count"] == 2, "distinct (subject, predicate, object)"
+    assert manifest["source_record_count"] == 3, "raw records in the archive"
+    assert manifest["variant_count"] == 3, "distinct (s, p, o, qualifier fingerprint)"
+
+    # Every artifact named in the manifest exists, with the recorded size.
+    for spec in manifest["artifacts"].values():
+        path = rel / spec["path"]
+        assert path.exists(), spec["path"]
+        if path.is_file():
+            assert path.stat().st_size == spec["bytes"]
+
+
+def test_manifest_hashes_match_the_published_artifacts(archive: Path, tmp_path: Path):
+    out = tmp_path / "releases"
+    assert _run(archive, out).returncode == 0
+    rel = out / "v1"
+    manifest = json.loads((rel / "manifest.json").read_text())
+
+    pkl = manifest["artifacts"]["pkl_zst"]
+    assert make_release._sha256_file(rel / pkl["path"])[0] == pkl["sha256"]
+    lmdb = manifest["artifacts"]["lmdb"]
+    assert make_release._sha256_tree(rel / lmdb["path"])[0] == lmdb["sha256_tree"]
+
+
+def test_existing_release_is_not_clobbered(archive: Path, tmp_path: Path):
+    out = tmp_path / "releases"
+    assert _run(archive, out).returncode == 0
+    before = (out / "v1" / "manifest.json").read_text()
+
+    second = _run(archive, out)
+    assert second.returncode != 0
+    assert "already exists" in second.stdout + second.stderr
+    assert (out / "v1" / "manifest.json").read_text() == before
+
+    assert _run(archive, out, "--force").returncode == 0
+    assert (out / "v1" / "manifest.json").exists()
+
+
+def test_failed_build_leaves_nothing_behind(archive: Path, tmp_path: Path):
+    """A release exists completely or not at all.
+
+    The staging directory matters because LMDBMetadataBackend.build() rmtree's
+    its target: a build that wrote directly into the release path would destroy
+    the previous release before knowing it could produce a new one.
+    """
+    out = tmp_path / "releases"
+    out.mkdir()
+    r = _run(tmp_path / "does-not-exist.tar.zst", out)
+    assert r.returncode != 0
+    assert list(out.iterdir()) == [], "staging or partial release left behind"
+
+
+def test_no_memmap_omits_it_from_the_manifest(archive: Path, tmp_path: Path):
+    out = tmp_path / "releases"
+    assert _run(archive, out, "--no-memmap").returncode == 0
+    manifest = json.loads((out / "v1" / "manifest.json").read_text())
+    assert "memmap" not in manifest["artifacts"]
+    assert not (out / "v1" / "kg.csrgraph.memmap").exists()
+
+
+def test_published_release_is_loadable(archive: Path, tmp_path: Path):
+    """The point of the whole exercise: the output actually serves."""
+    from csrgraph_kgx import CSRGraph
+    from metadata_db import LMDBMetadataBackend
+
+    out = tmp_path / "releases"
+    assert _run(archive, out).returncode == 0
+    rel = out / "v1"
+    manifest = json.loads((rel / "manifest.json").read_text())
+
+    graph = CSRGraph.load(str(rel / manifest["artifacts"]["pkl_zst"]["path"]))
+    assert graph.num_nodes == manifest["node_count"]
+
+    db = LMDBMetadataBackend(str(rel / manifest["artifacts"]["lmdb"]["path"]))
+    try:
+        variants = db.get_edge_variants("CHEBI:V", "biolink:affects", "NCBIGene:V")
+        assert len(variants) == 2, "both qualifier variants survived packaging"
+    finally:
+        db.close()

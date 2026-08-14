@@ -64,6 +64,19 @@ def _add_biolink(s: str) -> str:
     return s if ":" in s else _BIOLINK_PREFIX + s
 
 
+#: On-disk format of the metadata stores this code can read.
+#:
+#: Bump whenever a key layout changes.  Version 2 keys edge metadata on
+#: ``(subject, predicate, object, qualifier_fingerprint)``; version 1 omitted the
+#: fingerprint.  The distinction is not cosmetic and not gracefully degradable: a
+#: version-1 store read by version-2 code matches nothing, because the
+#: 4-component prefix scan never matches a 3-component key.  ``get_edge_variants``
+#: then returns ``[]``, every qualifier-constrained query answers nothing, and no
+#: error is raised — so a release must record this and the server must refuse to
+#: serve on a mismatch rather than answer with silent emptiness.
+STORE_FORMAT_VERSION = 2
+
+
 def qualifier_fingerprint(edge_meta: dict) -> str:
     """Short, content-derived discriminator for one edge's qualifier set.
 
