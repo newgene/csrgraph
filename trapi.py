@@ -226,7 +226,7 @@ def query(
     graph: CSRGraph,
     query_graph: dict,
     *,
-    limit: int = 100,
+    limit: int = 1000,
     expander: BiolinkExpander | None = None,
     node_subclassing: bool = True,
     subclass_depth: int | None = 1,
@@ -240,7 +240,30 @@ def query(
     query_graph : dict
         A TRAPI 1.6 ``QueryGraph`` dict with ``nodes`` and ``edges``.
     limit : int
-        Maximum number of results to return (default 100).
+        Maximum number of paths to **enumerate** (default 1000).
+
+        Not the same as "return at most this many answers".  Qualifier and
+        attribute constraints are applied *after* enumeration stops, so a
+        constrained query returns however many of the first *limit* paths
+        survive filtering, which can be far fewer.  ``message.logs`` carries a
+        ``ResultsTruncated`` entry whenever the cap bound, so a partial answer is
+        at least identifiable.
+
+        The default was 100, at which five of the eight answering HelmsDeep
+        corpus queries silently under-answered.  Measured on the 2026-07-19
+        graph, answer counts stop growing at:
+
+        =====================================  ======  =========
+        query                                  limit   answers
+        =====================================  ======  =========
+        ``one_hop_lookup_open``, ``mvp1_*``     500     141
+        ``batch_lookup``                        1000    637
+        ``mvp2_chem_affects_*``                 2000    721 / 782
+        =====================================  ======  =========
+
+        1000 keeps worst-case corpus latency around 200 ms.  Raise it toward
+        2000+ for MVP2-style qualifier queries, which are the most affected
+        because their constraints are the ones applied after the cap.
     expander : BiolinkExpander, optional
         When given, queried predicates and qualifier values are widened to their
         Biolink descendants before matching, so a query for ``biolink:treats``

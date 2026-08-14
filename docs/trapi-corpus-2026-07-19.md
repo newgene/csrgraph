@@ -631,9 +631,27 @@ deliberate choice rather than a defect.
 1. **Constraints are applied after the `limit` cap.** `limit` means "examine N
    paths, return however many survive", not "return N answers", so a constrained
    query silently under-answers. This produced the whole MVP2 gap (137 answers at
-   `limit=200` against 979 at `limit=5000`). Truncation is now reported in
-   `message.logs`, but the semantics are still surprising. Fix by pushing
-   constraints into enumeration, or by raising the default from 100.
+   `limit=200` against 979 at `limit=5000`).
+
+   **Partly mitigated, not fixed.** Truncation is reported in `message.logs`, and
+   the default limit was raised 100 → 1000 (ceiling 1000 → 10,000) after measuring
+   where corpus answer counts stop growing:
+
+   | query | converges at | answers |
+   | --- | --- | --- |
+   | `one_hop_lookup_open`, `mvp1_medium` | 500 | 141 |
+   | `batch_lookup` | 1000 | 637 |
+   | `mvp2_chem_affects_gene` / `_open_gene` | 2000 | 721 / 782 |
+   | `one_hop_no_predicate`, `two_hop_lookup` | never | 4,262 / 62,536 |
+
+   At the old default of 100, **five of the eight answering queries silently
+   under-answered**; the same query now returns its complete 141 rather than 100.
+   Worst-case corpus latency at 1000 is around 200 ms.
+
+   The *semantics* are unchanged: a sufficiently selective query still returns
+   fewer answers than exist, and MVP2-style qualifier queries need ~2000 for
+   completeness. The real fixes remain pushing constraints into enumeration, or
+   iterative deepening until `limit` answers survive.
 2. **`trapi_server.py` returns 400 for everything.** The `except Exception` around
    the query returns `status_code=400`, so an internal fault is reported as a
    client error. Malformed input is already rejected earlier by

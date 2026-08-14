@@ -61,9 +61,15 @@ if _env_file.exists():
 
 _DEFAULT_DATA_DIR = Path(os.environ.get("DATA_DIR", "~/tmp/csrgraph_data")).expanduser()
 
-# Maximum number of results a single query may request.
-_MAX_LIMIT = 1000
-_DEFAULT_LIMIT = 100
+# Bounds on how many paths a single query may enumerate.  These are an
+# enumeration budget, not an answer count: constraints are applied after the cap,
+# so a constrained query can return far fewer results than the limit (see
+# trapi.query).  The default was 100, at which five of the eight answering
+# HelmsDeep corpus queries silently under-answered; at 1000 worst-case corpus
+# latency is around 200 ms.  The ceiling leaves room for callers that need
+# completeness on qualifier queries, which converge around 2000.
+_MAX_LIMIT = 10_000
+_DEFAULT_LIMIT = 1000
 
 from csrgraph_kgx import CSRGraph
 from metadata_db import (
