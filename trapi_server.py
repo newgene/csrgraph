@@ -6,7 +6,7 @@ Elasticsearch) at startup, then exposes TRAPI query via a single POST endpoint.
 Usage::
 
     cd csrgraph
-    python trapi_server.py                          # defaults: translator_kg, port 8000
+    python trapi_server.py                          # defaults: translator_kg_2026-07-19, port 8000
     python trapi_server.py --port 9000              # custom port
     python trapi_server.py --data-dir ~/my/data     # custom data directory
     python trapi_server.py --graph dgidb             # use DGIdb instead
@@ -92,7 +92,7 @@ async def _lifespan(app: FastAPI):
     a no-op.
     """
     if _graph is None:
-        graph_name = os.environ.get("GRAPH_NAME", "translator_kg")
+        graph_name = os.environ.get("GRAPH_NAME", "translator_kg_2026-07-19")
         es_host = os.environ.get("ES_HOST", "http://localhost:9200")
         no_es = os.environ.get("NO_ES", "").lower() in {"1", "true", "yes"}
         _load_graph(_DEFAULT_DATA_DIR, graph_name, es_host=es_host, no_es=no_es)
@@ -1013,8 +1013,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--graph",
-        default="translator_kg",
-        help="Graph name stem, e.g. 'translator_kg' or 'dgidb' (default: translator_kg)",
+        default="translator_kg_2026-07-19",
+        help="Graph name stem, e.g. 'translator_kg_2026-07-19' or 'dgidb' "
+             f"(default: translator_kg_2026-07-19)",
     )
     parser.add_argument(
         "--es-host",

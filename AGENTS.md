@@ -60,9 +60,9 @@ A running Elasticsearch server is required for name lookup and category/text sea
 
 `kg_query.get_graph()` and the TRAPI server share these defaults (all overridable):
 
-- **Graph:** `translator_kg` (loads `<DATA_DIR>/translator_kg.csrgraph.pkl.zst`).
+- **Graph:** `translator_kg_2026-07-19` (loads `<DATA_DIR>/translator_kg_2026-07-19.csrgraph.pkl.zst`).
 - **Metadata backend:** Elasticsearch at `http://localhost:9200`, indices
-  `translator_kg_nodes` / `translator_kg_edges`.
+  `translator_kg_2026-07-19_nodes` / `translator_kg_2026-07-19_edges`.
 - **Data dir:** `~/tmp/csrgraph_data`.
 - Override via env vars `GRAPH_NAME`, `DATA_DIR`, `ES_HOST`, or via arguments to
   `get_graph(name=…, data_dir=…, es_host=…)`. Any graph stem present in the data dir
@@ -135,8 +135,23 @@ interactive network graph plus grouped tables:
 .venv/bin/python -m pytest -q          # data-free synthetic test suite
 ```
 
+`tests/test_corpus.py` additionally runs the
+[HelmsDeep](https://github.com/TranslatorSRI/HelmsDeep) TRAPI corpus against a
+**real** graph. It skips wherever the data is absent (CI included), so enable it
+by pointing at a built graph and putting `trapi_corpus.py` on the path:
+
+```bash
+DATA_DIR=~/tmp/csrgraph_data GRAPH_NAME=translator_kg_2026-07-19 PYTHONPATH=~/tmp \
+    .venv/bin/python -m pytest tests/test_corpus.py -q
+```
+
+It asserts invariants rather than answer counts — every supported shape returns
+something, bindings satisfy their queried categories, `query_id` marks exactly the
+subclass-expanded nodes, and a capped result declares itself. Counts would turn it
+into a tripwire for data changes rather than code changes.
+
 ## TRAPI server (optional)
 
 ```bash
-.venv/bin/python trapi_server.py       # defaults: translator_kg, ES on :9200, port 8000
+.venv/bin/python trapi_server.py       # defaults: translator_kg_2026-07-19, ES on :9200, port 8000
 ```

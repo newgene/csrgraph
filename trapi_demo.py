@@ -4,8 +4,8 @@ Copy-paste these blocks into a Python console to test interactively.
 Each block is a self-contained TRAPI query example.
 
 Prerequisites in DATA_DIR (default: ~/tmp/csrgraph_data/):
-    translator_kg.csrgraph.pkl.zst     (graph topology cache)
-    translator_kg.metadata.lmdb/       (LMDB metadata)
+    translator_kg_2026-07-19.csrgraph.pkl.zst     (graph topology cache)
+    translator_kg_2026-07-19.metadata.lmdb/       (LMDB metadata)
 """
 
 # %% Setup — run this block first
@@ -22,9 +22,9 @@ from trapi import display_query_graph, query
 
 DATA_DIR = Path.home() / "tmp" / "csrgraph_data"
 
-lmdb = LMDBMetadataBackend(str(DATA_DIR / "translator_kg.metadata.lmdb"))
+lmdb = LMDBMetadataBackend(str(DATA_DIR / "translator_kg_2026-07-19.metadata.lmdb"))
 t0 = time.time()
-graph = CSRGraph.load(str(DATA_DIR / "translator_kg.csrgraph.pkl.zst"), db=lmdb)
+graph = CSRGraph.load(str(DATA_DIR / "translator_kg_2026-07-19.csrgraph.pkl.zst"), db=lmdb)
 print(f"Loaded in {time.time() - t0:.3f}s  —  "
       f"{graph.num_nodes:,} nodes, {graph.edge_count:,} edges, "
       f"{len(graph.relations)} predicates\n")

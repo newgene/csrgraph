@@ -97,7 +97,7 @@ def collect(
             curies.update((s, o))
 
     es = g.db._es
-    idx = getattr(g.db, "_nodes_idx", "translator_kg_nodes")
+    idx = getattr(g.db, "_nodes_idx", "translator_kg_2026-07-19_nodes")
     resp = es.mget(index=idx, ids=list(curies), _source=["name", "category"])
     meta: dict[str, dict] = {}
     for doc in resp["docs"]:
@@ -285,7 +285,7 @@ def render_html(data: dict) -> str:
 <body>
 <header>
   <h1><span class="gene">{_esc(src_name)}</span> ({_esc(src)}) &rarr; {_esc(data['to_category'])}</h1>
-  <div class="sub">csrgraph &middot; graph <b>translator_kg</b> &middot; node-subclassing on &middot;
+  <div class="sub">csrgraph &middot; graph <b>translator_kg_2026-07-19</b> &middot; node-subclassing on &middot;
     {len(direct_rows)} direct endpoints, {len(two_rows)} additional via 2-hop &middot; generated {generated}</div>
 </header>
 <div class="wrap">

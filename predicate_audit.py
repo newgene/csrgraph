@@ -19,9 +19,9 @@ The graph loader stores edges exactly as they appear in the KGX archive
 Usage::
 
     python predicate_audit.py \
-        --graph ~/tmp/csrgraph_data/translator_kg.csrgraph.pkl.zst \
-        --lmdb  ~/tmp/csrgraph_data/translator_kg.metadata.lmdb \
-        --out   translator_kg_predicate_audit.html
+        --graph ~/tmp/csrgraph_data/translator_kg_2026-07-19.csrgraph.pkl.zst \
+        --lmdb  ~/tmp/csrgraph_data/translator_kg_2026-07-19.metadata.lmdb \
+        --out   translator_kg_2026-07-19_predicate_audit.html
 """
 
 from __future__ import annotations

@@ -44,8 +44,8 @@ def main():
     args = ap.parse_args()
 
     old = load_old(args.old_ref)
-    db = LMDBMetadataBackend(str(DATA / "translator_kg.metadata.lmdb"))
-    g = CSRGraph.load(str(DATA / "translator_kg.csrgraph.pkl.zst"), db=db)
+    db = LMDBMetadataBackend(str(DATA / "translator_kg_2026-07-19.metadata.lmdb"))
+    g = CSRGraph.load(str(DATA / "translator_kg_2026-07-19.csrgraph.pkl.zst"), db=db)
     print(f"relations: {len(g.csr_by_relation)}")
 
     # Sample frontier: the 2-hop neighbourhood of START, which is what a real

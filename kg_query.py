@@ -2,9 +2,9 @@
 
 This module is the convenience layer used to answer natural-language questions
 like *"find paths connecting FREM1 to any disease"* against the loaded
-``translator_kg`` graph.  It wraps the lower-level :class:`CSRGraph` API with:
+Translator KG graph.  It wraps the lower-level :class:`CSRGraph` API with:
 
-* a cached graph loader that defaults to the latest **translator_kg** snapshot
+* a cached graph loader that defaults to the **translator_kg_2026-07-19** snapshot
   and the Elasticsearch metadata backend (override via env vars or arguments);
 * name/symbol -> CURIE resolution through Elasticsearch;
 * batch CURIE -> name resolution;
@@ -44,7 +44,7 @@ from metadata_db import ElasticsearchMetadataBackend
 # Defaults (env-overridable, matching trapi_server.py conventions)
 # --------------------------------------------------------------------------- #
 DEFAULT_DATA_DIR = Path(os.environ.get("DATA_DIR", "~/tmp/csrgraph_data")).expanduser()
-DEFAULT_GRAPH = os.environ.get("GRAPH_NAME", "translator_kg")
+DEFAULT_GRAPH = os.environ.get("GRAPH_NAME", "translator_kg_2026-07-19")
 DEFAULT_ES_HOST = os.environ.get("ES_HOST", "http://localhost:9200")
 
 PathEdge = tuple  # (subject, predicate, object)
@@ -61,7 +61,7 @@ def get_graph(
 ) -> CSRGraph:
     """Load (and cache) a graph by stem name with an Elasticsearch backend.
 
-    Defaults to the latest ``translator_kg`` snapshot in ``~/tmp/csrgraph_data``.
+    Defaults to the ``translator_kg_2026-07-19`` snapshot in ``~/tmp/csrgraph_data``.
     The result is memoised, so repeated calls in one process reuse the same
     in-memory graph.
     """

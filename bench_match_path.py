@@ -1,6 +1,6 @@
 """Benchmark: per-frontier-node vs. batched metadata filtering in ``match_path``.
 
-Loads the local ``translator_kg`` snapshot with the LMDB metadata backend once,
+Loads the local ``translator_kg_2026-07-19`` snapshot with the LMDB metadata backend once,
 then runs the same multi-hop association query through two code paths:
 
 * **old** — ``csrgraph_kgx.py`` at git HEAD, which calls ``filter_edges`` /
@@ -156,9 +156,9 @@ def main():
 
     old = load_old_module(args.old_ref)
 
-    inner = LMDBMetadataBackend(str(DATA / "translator_kg.metadata.lmdb"))
+    inner = LMDBMetadataBackend(str(DATA / "translator_kg_2026-07-19.metadata.lmdb"))
     db = CountingBackend(inner)
-    g = CSRGraph.load(str(DATA / "translator_kg.csrgraph.pkl.zst"), db=db)
+    g = CSRGraph.load(str(DATA / "translator_kg_2026-07-19.csrgraph.pkl.zst"), db=db)
     print(f"graph: {len(g.nodes):,} nodes, {g.csr_merged.nnz:,} edges")
     print(f"start: {START}  target category: {TARGET_CATEGORY}  limit={args.limit}\n")
 

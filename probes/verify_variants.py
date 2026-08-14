@@ -13,6 +13,14 @@ that scale a 64-bit collision has probability ~2e-5, far below the precision
 this check needs.
 
     .venv/bin/python probes/verify_variants.py
+
+Needs the *extracted* jsonl, which is not kept around (24 GB). Re-extract it
+from the archive first:
+
+    mkdir -p ~/tmp/gandalf_data/kgx_2026-07-19
+    tar --use-compress-program=zstd \
+        -xf ~/tmp/csrgraph_data/translator_kg_2026-07-19.tar.zst \
+        -C ~/tmp/gandalf_data/kgx_2026-07-19
 """
 
 from __future__ import annotations
@@ -74,6 +82,11 @@ def _scan(args) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
 
 
 def main() -> None:
+    if not os.path.exists(EDGES):
+        raise SystemExit(
+            f"{EDGES} not found — re-extract it from the archive first "
+            "(see this file's docstring)."
+        )
     size = os.path.getsize(EDGES)
     step = size // WORKERS
     ranges = [(i * step, size if i == WORKERS - 1 else (i + 1) * step)

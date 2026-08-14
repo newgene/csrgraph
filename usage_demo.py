@@ -4,9 +4,9 @@ Copy-paste these blocks into a Python console to test interactively.
 No original KGX archive needed — only pre-built cache files.
 
 Prerequisites in DATA_DIR (default: ~/tmp/csrgraph_data/):
-    translator_kg.csrgraph.pkl.zst     (graph topology cache)
-    translator_kg.metadata.lmdb/       (LMDB metadata)
-    translator_kg_nodes / _edges       (ES indices, already built)
+    translator_kg_2026-07-19.csrgraph.pkl.zst     (graph topology cache)
+    translator_kg_2026-07-19.metadata.lmdb/       (LMDB metadata)
+    translator_kg_2026-07-19_nodes / _edges       (ES indices, already built)
 """
 
 # %% Setup — run this block first
@@ -25,21 +25,21 @@ from metadata_db import (
 
 DATA_DIR = Path.home() / "tmp" / "csrgraph_data"
 ES_HOST = "http://localhost:9200"
-ES_PREFIX = "translator_kg"
+ES_PREFIX = "translator_kg_2026-07-19"
 
 # %% 1. Load graph with metadata backend — single entry point
-lmdb = LMDBMetadataBackend(str(DATA_DIR / "translator_kg.metadata.lmdb"))
+lmdb = LMDBMetadataBackend(str(DATA_DIR / "translator_kg_2026-07-19.metadata.lmdb"))
 es = ElasticsearchMetadataBackend(host=ES_HOST, index_prefix=ES_PREFIX)
 db = HybridMetadataBackend(lmdb=lmdb, es=es)
 
 t0 = time.time()
-graph = CSRGraph.load(str(DATA_DIR / "translator_kg.csrgraph.pkl.zst"), db=db)
+graph = CSRGraph.load(str(DATA_DIR / "translator_kg_2026-07-19.csrgraph.pkl.zst"), db=db)
 print(f"Loaded in {time.time() - t0:.3f}s  —  "
       f"{graph.num_nodes:,} nodes, {graph.edge_count:,} edges, "
       f"{len(graph.relations)} predicates")
 
 # Alternative: attach db after loading
-#   graph = CSRGraph.load(str(DATA_DIR / "translator_kg.csrgraph.pkl.zst"))
+#   graph = CSRGraph.load(str(DATA_DIR / "translator_kg_2026-07-19.csrgraph.pkl.zst"))
 #   graph.set_db(db)
 
 # %% Helper: resolve display name from metadata
