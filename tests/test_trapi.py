@@ -1163,3 +1163,304 @@ class TestSubclassDepth:
         assert self._answers(chain_graph, subclass_depth=2) == {
             "C:root", "C:mid", "C:leaf"
         }
+
+
+class TestSubclassBindingConformance:
+    """Subclass-expanded bindings must honour categories and declare query_id.
+
+    ``match_path`` expands a pinned node to its ``subclass_of`` descendants and
+    binds the descendant. Real Translator data asserts ``HP:x subclass_of
+    MONDO:y``, so a disease-constrained query could bind a phenotype — an answer
+    contradicting the query — and nothing said the bound CURIE was a stand-in for
+    the queried one.
+    """
+
+    @pytest.fixture(scope="class")
+    def graph(self):
+        from csrgraph_kgx import CSRGraph
+
+        # D:sub is a Disease subtype; P:sub is a PhenotypicFeature asserted as a
+        # subclass of the same disease, mirroring the MONDO/HP shape in the KG.
+        triples = [
+            ("D:sub", "biolink:subclass_of", "D:root"),
+            ("P:sub", "biolink:subclass_of", "D:root"),
+            ("C:root", "biolink:treats", "D:root"),
+            ("C:sub", "biolink:treats", "D:sub"),
+            ("C:phen", "biolink:treats", "P:sub"),
+        ]
+        g = CSRGraph(triples)
+        g.set_db(_StubDB(node_meta={
+            "D:root": {"id": "D:root", "category": ["biolink:Disease"]},
+            "D:sub": {"id": "D:sub", "category": ["biolink:Disease"]},
+            "P:sub": {"id": "P:sub", "category": ["biolink:PhenotypicFeature"]},
+            "C:root": {"id": "C:root", "category": ["biolink:ChemicalEntity"]},
+            "C:sub": {"id": "C:sub", "category": ["biolink:ChemicalEntity"]},
+            "C:phen": {"id": "C:phen", "category": ["biolink:ChemicalEntity"]},
+        }))
+        return g
+
+    def _run(self, g, categories):
+        from trapi import query
+
+        n1 = {"ids": ["D:root"]}
+        if categories:
+            n1["categories"] = categories
+        qg = {"nodes": {"n0": {}, "n1": n1},
+              "edges": {"e0": {"subject": "n0", "object": "n1",
+                               "predicates": ["biolink:treats"]}}}
+        msg = query(g, qg, limit=100)
+        return {b["id"]: b.get("query_id")
+                for r in msg["results"] for b in r["node_bindings"]["n1"]}
+
+    def test_expanded_node_must_satisfy_queried_category(self, graph):
+        """The phenotype subclass is dropped when the query asks for Disease."""
+        bound = self._run(graph, ["biolink:Disease"])
+        assert "P:sub" not in bound, "a PhenotypicFeature answers a Disease query"
+        assert set(bound) == {"D:root", "D:sub"}
+
+    def test_query_id_marks_expanded_nodes(self, graph):
+        bound = self._run(graph, ["biolink:Disease"])
+        # The descendant declares the CURIE it stands in for...
+        assert bound["D:sub"] == "D:root"
+        # ...and a direct hit does not, so clients can tell them apart.
+        assert bound["D:root"] is None
+
+    def test_no_category_constraint_keeps_every_subclass(self, graph):
+        """Without a categories constraint there is nothing to violate."""
+        bound = self._run(graph, None)
+        assert set(bound) == {"D:root", "D:sub", "P:sub"}
+        assert bound["P:sub"] == "D:root"
+
+    def test_disabling_subclassing_needs_no_query_id(self, graph):
+        from trapi import query
+
+        qg = {"nodes": {"n0": {}, "n1": {"ids": ["D:root"],
+                                        "categories": ["biolink:Disease"]}},
+              "edges": {"e0": {"subject": "n0", "object": "n1",
+                               "predicates": ["biolink:treats"]}}}
+        msg = query(g_ := graph, qg, limit=100, node_subclassing=False)
+        bindings = [b for r in msg["results"] for b in r["node_bindings"]["n1"]]
+        assert {b["id"] for b in bindings} == {"D:root"}
+        assert all("query_id" not in b for b in bindings)
+
+
+# ---------------------------------------------------------------------------
+# Determinism under truncation
+# ---------------------------------------------------------------------------
+
+_DETERMINISM_SCRIPT = """
+import sys
+sys.path.insert(0, %r)
+from csrgraph_kgx import CSRGraph
+from metadata_db import MetadataBackend
+import trapi
+
+
+class _DB(MetadataBackend):
+    def get_node(self, nid):
+        return {"id": nid, "category": ["biolink:ChemicalEntity"]}
+
+    def get_edge(self, s, p, o):
+        return {"subject": s, "predicate": p, "object": o}
+
+    def filter_nodes(self, node_ids, *, category=None, extra_filters=None):
+        return [self.get_node(n) for n in node_ids]
+
+    def filter_edges(self, edges, *, knowledge_level=None, agent_type=None,
+                     extra_filters=None):
+        return [{"subject": s, "predicate": p, "object": o} for s, p, o in edges]
+
+    def close(self):
+        pass
+
+
+# 60 candidates behind a *symmetric* predicate, which routes the query to
+# _general_match rather than match_path, with limit=5 so truncation bites.
+triples = [("C:%%02d" %% i, "biolink:associated_with", "D:1") for i in range(60)]
+g = CSRGraph(triples)
+g.set_db(_DB())
+qg = {"nodes": {"n0": {"categories": ["biolink:ChemicalEntity"]},
+                "n1": {"ids": ["D:1"]}},
+      "edges": {"e0": {"subject": "n0", "object": "n1",
+                       "predicates": ["biolink:associated_with"]}}}
+msg = trapi.query(g, qg, limit=5)
+kept = [b["id"] for r in msg["results"] for b in r["node_bindings"]["n0"]]
+print(",".join(kept))
+print("TRUNCATED" if msg.get("logs") else "COMPLETE")
+"""
+
+
+def _run_with_hashseed(seed: str) -> tuple[str, str]:
+    """Run the query in a subprocess with a fixed PYTHONHASHSEED."""
+    import os
+    import subprocess
+
+    root = str(Path(__file__).resolve().parent.parent)
+    env = {**os.environ, "PYTHONHASHSEED": seed}
+    out = subprocess.run(
+        [sys.executable, "-c", _DETERMINISM_SCRIPT % root],
+        capture_output=True, text=True, env=env, check=True,
+    ).stdout.splitlines()
+    return out[0], out[1]
+
+
+class TestTruncationDeterminism:
+    """A truncated result must not depend on the process's hash seed.
+
+    ``_general_match`` collected candidate CURIEs into a ``set[str]`` and
+    iterated it. Python randomises ``str.__hash__`` per process, so the
+    exploration order — and therefore *which* candidates survived the ``limit``
+    — changed on every run. Measured on the real graph, one query returned three
+    different genes across three runs. ``match_path`` was unaffected because it
+    works on ``int`` node indices, whose hash is identity.
+    """
+
+    def test_same_answers_across_hash_seeds(self):
+        first, _ = _run_with_hashseed("1")
+        second, _ = _run_with_hashseed("2")
+        third, _ = _run_with_hashseed("12345")
+        assert first == second == third, (
+            f"truncated result varies with PYTHONHASHSEED: "
+            f"{first} / {second} / {third}"
+        )
+
+    def test_truncation_is_reported_in_logs(self):
+        _, status = _run_with_hashseed("1")
+        assert status == "TRUNCATED", (
+            "a capped result set must say so in message.logs, or a client "
+            "cannot tell a partial answer from a complete one"
+        )
+
+
+class TestTruncationLogs:
+    """message.logs appears only when the answer really is a subset."""
+
+    @pytest.fixture(scope="class")
+    def graph(self):
+        from csrgraph_kgx import CSRGraph
+
+        g = CSRGraph([("C:1", "biolink:treats", "D:1"),
+                      ("C:2", "biolink:treats", "D:1"),
+                      ("C:3", "biolink:treats", "D:1")])
+        g.set_db(_StubDB())
+        return g
+
+    def _msg(self, g, limit):
+        from trapi import query
+
+        qg = {"nodes": {"n0": {}, "n1": {"ids": ["D:1"]}},
+              "edges": {"e0": {"subject": "n0", "object": "n1",
+                               "predicates": ["biolink:treats"]}}}
+        return query(g, qg, limit=limit)
+
+    def test_no_logs_when_complete(self, graph):
+        msg = self._msg(graph, 100)
+        assert len(msg["results"]) == 3
+        assert "logs" not in msg
+
+    def test_logs_when_capped(self, graph):
+        msg = self._msg(graph, 2)
+        assert len(msg["results"]) == 2
+        assert msg["logs"][0]["code"] == "ResultsTruncated"
+        assert msg["logs"][0]["level"] == "WARNING"
+
+
+class TestSymmetricHops:
+    """Symmetric predicates are matched on the vectorized path, both ways.
+
+    Biolink declares 39 predicates symmetric, and for those an assertion stored
+    one way answers a query posed the other way. These queries used to divert to
+    ``_general_match``, which costs an order of magnitude (26.7 s against 0.33 s
+    on the HelmsDeep two_hop_lookup shape). ``match_path`` now takes a hop
+    direction of ``None`` and walks both ways.
+    """
+
+    @pytest.fixture(scope="class")
+    def graph(self):
+        from csrgraph_kgx import CSRGraph
+
+        # Only ONE stored orientation for each pair, so a query posed the other
+        # way can only succeed if both directions are walked.
+        return CSRGraph([
+            ("C:1", "biolink:interacts_with", "C:2"),
+            ("C:3", "biolink:interacts_with", "C:1"),
+            ("C:1", "biolink:treats", "D:1"),
+        ])
+
+    def _ask(self, g, subj, obj, predicate="biolink:interacts_with"):
+        from trapi import query
+
+        g.set_db(_StubDB())
+        qg = {"nodes": {"n0": {"ids": [subj]}, "n1": {"ids": [obj]}},
+              "edges": {"e0": {"subject": "n0", "object": "n1",
+                               "predicates": [predicate]}}}
+        msg = query(g, qg, limit=10, node_subclassing=False)
+        edges = msg["knowledge_graph"]["edges"]
+        return len(msg["results"]), [
+            (e["subject"], e["object"]) for e in edges.values()
+        ]
+
+    def test_matches_in_stored_direction(self, graph):
+        n, orient = self._ask(graph, "C:1", "C:2")
+        assert n == 1 and orient == [("C:1", "C:2")]
+
+    def test_matches_against_stored_direction(self, graph):
+        """The whole point: C:3 -> C:1 answers a query for C:1 -> C:3."""
+        n, orient = self._ask(graph, "C:1", "C:3")
+        assert n == 1, "symmetric predicate not matched against its stored direction"
+        # The knowledge graph must still report the edge as it is stored.
+        assert orient == [("C:3", "C:1")]
+
+    def test_asymmetric_predicate_still_one_way(self, graph):
+        """Only symmetric predicates get this treatment."""
+        assert self._ask(graph, "C:1", "D:1", "biolink:treats")[0] == 1
+        assert self._ask(graph, "D:1", "C:1", "biolink:treats")[0] == 0
+
+    def test_extra_spec_unions_both_directions(self, graph):
+        """An extra spec adds the opposite-direction walk to the primary one."""
+        graph.set_db(_StubDB())
+        spec = ["C:1", "biolink:interacts_with", None]
+        fwd = graph.match_path(spec, limit=10, hop_directions=[True])
+        rev = graph.match_path(spec, limit=10, hop_directions=[False])
+        both = graph.match_path(
+            spec, limit=10, hop_directions=[True],
+            hop_extra_specs=[("biolink:interacts_with",)],
+        )
+        assert {p[0] for p in fwd} == {("C:1", "biolink:interacts_with", "C:2")}
+        assert {p[0] for p in rev} == {("C:3", "biolink:interacts_with", "C:1")}
+        assert {p[0] for p in both} == {p[0] for p in fwd} | {p[0] for p in rev}
+
+    def test_extra_spec_covers_only_the_predicates_it_names(self, graph):
+        """A one-way predicate is not dragged along by a symmetric sibling.
+
+        The hop lists both, but only interacts_with may be walked backwards;
+        matching treats in reverse would assert that a disease treats a drug.
+        """
+        from trapi import query
+
+        graph.set_db(_StubDB())
+        qg = {"nodes": {"n0": {"ids": ["D:1"]}, "n1": {"ids": ["C:1"]}},
+              "edges": {"e0": {"subject": "n0", "object": "n1",
+                               "predicates": ["biolink:treats",
+                                              "biolink:interacts_with"]}}}
+        msg = query(graph, qg, limit=10, node_subclassing=False)
+        assert len(msg["results"]) == 0, (
+            "a one-way treats edge matched backwards because a symmetric "
+            "predicate shared the hop"
+        )
+
+    def test_both_orientations_stored_yields_one_path(self):
+        """A pair asserted both ways under one symmetric predicate is one answer."""
+        from csrgraph_kgx import CSRGraph
+
+        g = CSRGraph([
+            ("C:1", "biolink:interacts_with", "C:2"),
+            ("C:2", "biolink:interacts_with", "C:1"),
+        ])
+        g.set_db(_StubDB())
+        paths = g.match_path(["C:1", "biolink:interacts_with", None],
+                             limit=10, hop_directions=[True],
+                             hop_extra_specs=[("biolink:interacts_with",)])
+        assert len(paths) == 1, f"duplicate assertion emitted twice: {paths}"
+        # Forward is walked first, so its orientation is the one kept.
+        assert paths[0][0] == ("C:1", "biolink:interacts_with", "C:2")

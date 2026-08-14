@@ -16,6 +16,7 @@ only metadata storage and retrieval — they accept lists of node CURIEs or
 from __future__ import annotations
 
 import abc
+import hashlib
 import json
 import os
 import sqlite3
@@ -61,6 +62,43 @@ def _add_biolink(s: str) -> str:
     # so non-biolink predicates/categories aren't corrupted into
     # "biolink:rdfs:subClassOf".
     return s if ":" in s else _BIOLINK_PREFIX + s
+
+
+def qualifier_fingerprint(edge_meta: dict) -> str:
+    """Short, content-derived discriminator for one edge's qualifier set.
+
+    Edge metadata is keyed by ``(subject, predicate, object)`` plus this, so that
+    the same triple asserted with different qualifiers is stored as separate
+    records rather than one overwriting the other.
+
+    Two properties matter:
+
+    * **Content-derived, not positional.** The value depends only on the qualifiers,
+      so it is identical across rebuilds regardless of input order — which an
+      ordinal variant index would not be.
+    * **Empty for unqualified edges.** Most triples carry a single variant and no
+      qualifiers at all, so those keep a one-byte suffix instead of a hash,
+      keeping the key overhead negligible.
+
+    Measured on the 2026-07-19 archive (``probes/verify_variants.py``):
+
+    ==========================================  ==============
+    raw edge records                             28,925,258
+    distinct ``(s, p, o)``                       28,105,517
+    distinct ``(s, p, o, fingerprint)``          28,860,305
+    ==========================================  ==============
+
+    So keying on the triple alone was dropping **754,788 assertions**, and the
+    qualifier set recovers all but 64,953 of the duplicate records — those remain
+    collapsed because they are indistinguishable in their qualifiers.  Variants
+    per triple: 98.18% have exactly one, the mean is 1.0269, and the maximum is
+    **128**, which is the number any per-triple fetch bound has to clear.
+    """
+    quals = {k: v for k, v in edge_meta.items() if "qualifier" in k}
+    if not quals:
+        return ""
+    canonical = json.dumps(quals, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha1(canonical.encode()).hexdigest()[:10]
 
 
 def _strip_biolink(s: str) -> str:
@@ -269,6 +307,28 @@ class MetadataBackend(abc.ABC):
             Additional key/value filters on edge metadata fields.
             Indexed fields use SQL WHERE; others use Python-side filtering.
         """
+
+    def get_edge_variants(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+    ) -> list[dict]:
+        """Every stored edge for this triple, one per distinct qualifier set.
+
+        A KGX archive routinely asserts the same ``(subject, predicate, object)``
+        more than once with *different* qualifiers — e.g. one record saying a
+        chemical decreases a gene's abundance and another saying it increases it.
+        Keying edge metadata on the triple alone keeps only the last of those, so a
+        query constraining qualifiers silently misses answers.  This returns all of
+        them; a constraint matches when **any** variant satisfies it.
+
+        The default returns at most one edge, which is correct for backends that do
+        not store variants separately (SQLite, DuckDB).  LMDB and Elasticsearch
+        override it.
+        """
+        edge = self.get_edge(subject, predicate, obj)
+        return [edge] if edge else []
 
     def nodes_by_category(
         self,
@@ -1363,7 +1423,13 @@ class LMDBMetadataBackend(MetadataBackend):
                     if at:
                         meta["agent_type"] = at
                     meta.update(xtra)
-                    ekey = sep.join([subj.encode(), pred_s.encode(), obj.encode()])
+                    # Include the qualifier fingerprint so a triple asserted more
+                    # than once with different qualifiers keeps every variant
+                    # instead of the last one overwriting the rest.
+                    ekey = sep.join([
+                        subj.encode(), pred_s.encode(), obj.encode(),
+                        qualifier_fingerprint(meta).encode(),
+                    ])
                     txn.put(ekey, _compress_blob(meta) or b"", db=db._edges_db)
                     if kl:
                         klkey = sep.join([kl.encode(), subj.encode(), pred_s.encode(), obj.encode()])
@@ -1393,14 +1459,50 @@ class LMDBMetadataBackend(MetadataBackend):
             return {}
         return self._normalise_node(_decompress_blob(val))
 
+    def _variant_prefix(self, subject: str, predicate: str, obj: str) -> bytes:
+        return self._SEP.join([
+            subject.encode(), _strip_biolink(predicate).encode(), obj.encode(),
+        ]) + self._SEP
+
     def get_edge(self, subject: str, predicate: str, obj: str) -> dict:
-        pred_s = _strip_biolink(predicate)
-        ekey   = self._SEP.join([subject.encode(), pred_s.encode(), obj.encode()])
+        """One edge for this triple.
+
+        When several qualifier variants exist the lowest fingerprint wins, which
+        is deterministic across rebuilds. Callers that must see all of them --
+        anything filtering on qualifiers -- should use
+        :meth:`get_edge_variants`.
+        """
+        variants = self.get_edge_variants(subject, predicate, obj)
+        return variants[0] if variants else {}
+
+    def get_edge_variants(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+    ) -> list[dict]:
+        """All qualifier variants of this triple, ordered by fingerprint.
+
+        A prefix scan rather than an exact get.  Measured on the full store this
+        costs 1.00 us/edge against 0.96 us for an exact get -- LMDB positions the
+        same B-tree cursor either way -- so there is no fast path worth keeping
+        separate for the ~99% of triples that have one variant.
+        """
+        prefix = self._variant_prefix(subject, predicate, obj)
+        out: list[dict] = []
         with self._env.begin() as txn:
-            val = txn.get(ekey, db=self._edges_db)
-        if val is None:
-            return {}
-        return self._normalise_edge(_decompress_blob(val))
+            cursor = txn.cursor(db=self._edges_db)
+            if cursor.set_range(prefix):
+                while True:
+                    key = cursor.key()
+                    if not key.startswith(prefix):
+                        break
+                    val = cursor.value()
+                    if val:
+                        out.append(self._normalise_edge(_decompress_blob(val)))
+                    if not cursor.next():
+                        break
+        return out
 
     # -- Bulk filtering ------------------------------------------------------
 
@@ -1511,15 +1613,31 @@ class LMDBMetadataBackend(MetadataBackend):
         with self._env.begin() as txn:
             for subj, pred, obj in edges:
                 if pred is not None:
-                    ekey = sep.join([subj.encode(), _strip_biolink(pred).encode(), obj.encode()])
-                    val  = txn.get(ekey, db=self._edges_db)
-                    if val is None:
-                        continue
-                    data = _decompress_blob(val)
-                    if self._edge_matches(data, knowledge_level, agent_type, extra_filters):
-                        results.append(self._normalise_edge(data))
+                    # Every qualifier variant of this triple shares this prefix, and
+                    # each is filtered on its own merits: a triple asserted once as
+                    # "decreased" and once as "increased" matches a query for
+                    # either, which keying on the triple alone could not express.
+                    prefix = sep.join([
+                        subj.encode(), _strip_biolink(pred).encode(), obj.encode(),
+                    ]) + sep
+                    cursor = txn.cursor(db=self._edges_db)
+                    if cursor.set_range(prefix):
+                        while True:
+                            if not cursor.key().startswith(prefix):
+                                break
+                            val = cursor.value()
+                            if val:
+                                data = _decompress_blob(val)
+                                if self._edge_matches(
+                                    data, knowledge_level, agent_type, extra_filters
+                                ):
+                                    results.append(self._normalise_edge(data))
+                            if not cursor.next():
+                                break
                 else:
-                    # Scan all edges for this subject, then filter by object
+                    # Any predicate: scan this subject's edges and keep the ones
+                    # landing on obj.  Keys are subject/predicate/object/fingerprint,
+                    # so four components — not three.
                     prefix = subj.encode() + sep
                     cursor = txn.cursor(db=self._edges_db)
                     if cursor.set_range(prefix):
@@ -1528,7 +1646,7 @@ class LMDBMetadataBackend(MetadataBackend):
                             if not raw_key.startswith(prefix):
                                 break
                             parts = raw_key.split(sep)
-                            if len(parts) == 3 and parts[2].decode() == obj:
+                            if len(parts) == 4 and parts[2].decode() == obj:
                                 data = _decompress_blob(cursor.value())
                                 if self._edge_matches(data, knowledge_level, agent_type, extra_filters):
                                     results.append(self._normalise_edge(data))
@@ -1891,7 +2009,14 @@ class ElasticsearchMetadataBackend(MetadataBackend):
                 ok, errors = bulk(es, (
                     {
                         "_index": db._edges_idx,
-                        "_id": f"{d['subject']}|{d['predicate']}|{d['object']}",
+                        # Include the qualifier fingerprint: a deterministic id on
+                        # the triple alone made variants overwrite each other, which
+                        # is why the edge index held 28,105,517 docs for 28,925,258
+                        # source records.
+                        "_id": (
+                            f"{d['subject']}|{d['predicate']}|{d['object']}"
+                            f"|{qualifier_fingerprint(d)}"
+                        ),
                         "_source": d,
                     }
                     for d in edge_buf
@@ -1974,6 +2099,51 @@ class ElasticsearchMetadataBackend(MetadataBackend):
             # Genuinely absent — distinct from a connection/transport error,
             # which we deliberately let propagate rather than mask as "{}".
             return {}
+
+    def get_edge_variants(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+    ) -> list[dict]:
+        """All qualifier variants of this triple.
+
+        Retrieval is by term query on subject/predicate/object, so it already
+        returns every stored document for the triple; only the write-time ``_id``
+        needed the fingerprint to stop variants overwriting one another.
+
+        Deliberately **not** bounded by ``max_edges_per_pair``.  That constant
+        sizes the bulk :meth:`filter_edges` path, where it trades against msearch
+        batch size, and its default of 100 truncated real triples here:
+        ``CHEBI:33216 -affects-> GO:0008283`` carries 103 variants in the
+        2026-07-19 graph, so ES returned 100 where LMDB returned all 103 — both a
+        dropped-answer bug on qualifier constraints and a divergence between the
+        two backends.  This is a single-triple point lookup, one request either
+        way, so it uses the result window instead: a triple with more variants
+        than that is implausible (the observed maximum is ~10^2), and if one ever
+        appears the count is reported rather than silently dropped.
+        """
+        resp = self._es.search(
+            index=self._edges_idx,
+            query={"bool": {"must": [
+                {"term": {"subject": subject}},
+                {"term": {"predicate": _strip_biolink(predicate)}},
+                {"term": {"object": obj}},
+            ]}},
+            size=self._ES_MAX_RESULT_WINDOW,
+            track_total_hits=True,
+        )
+        hits = resp["hits"]["hits"]
+        total = resp["hits"]["total"]["value"]
+        if total > len(hits):
+            warnings.warn(
+                f"{subject} -{predicate}-> {obj} has {total:,} stored variants; "
+                f"returning the first {len(hits):,} (index.max_result_window). "
+                "Qualifier constraints on this edge may miss answers.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return [self._normalise_edge(h["_source"]) for h in hits]
 
     def get_edge(self, subject: str, predicate: str, obj: str) -> dict:
         from elasticsearch import NotFoundError  # type: ignore[import]
@@ -2126,16 +2296,21 @@ class ElasticsearchMetadataBackend(MetadataBackend):
                     for hit in r.get("hits", {}).get("hits", []):
                         results.append(self._normalise_edge(hit["_source"]))
 
-        # ── Wildcard-predicate edges: bool/should search ─────────────────────
-        # Batched in chunks so that neither the ``should`` clause count nor
-        # ``size`` exceeds ``_ES_MAX_RESULT_WINDOW``.
+        # ── Wildcard-predicate edges: msearch, one sub-query per pair ─────────
+        # This used to be a single bool/should query per chunk with
+        # ``size = len(batch) * per_pair``.  That budget is *shared*: ES returns
+        # the globally top-scoring hits, so one dense pair could consume it and
+        # crowd other pairs of the same chunk out entirely — dropping whole
+        # predicates rather than surplus variants of one.  Qualifier-variant
+        # keying made that acute, since a pair like
+        # ``CHEBI:33216 / GO:0008283`` now stores 103 documents where it
+        # previously stored one.  An msearch gives each pair its own ``size``,
+        # for the same number of HTTP round-trips as the known-predicate branch.
         if no_pred:
-            # Each (subject, object) pair may yield up to per_pair edges, so we
-            # limit chunks so that chunk_len * per_pair <= _ES_MAX_RESULT_WINDOW.
-            _SHOULD_CHUNK = max(1, self._ES_MAX_RESULT_WINDOW // per_pair)
-            for batch_start in range(0, len(no_pred), _SHOULD_CHUNK):
-                batch = no_pred[batch_start : batch_start + _SHOULD_CHUNK]
-                should: list[dict] = []
+            _MSEARCH_BATCH_NP = max(1, self._ES_MAX_RESULT_WINDOW // per_pair)
+            for batch_start in range(0, len(no_pred), _MSEARCH_BATCH_NP):
+                batch = no_pred[batch_start : batch_start + _MSEARCH_BATCH_NP]
+                searches_np: list[dict] = []
                 for s, o in batch:
                     must_np: list[dict] = [
                         {"term": {"subject": s}},
@@ -2147,14 +2322,14 @@ class ElasticsearchMetadataBackend(MetadataBackend):
                         must_np.append({"term": {"agent_type": agent_type}})
                     for k, v in pushdown.items():
                         must_np.append({"term": {k: str(v)}})
-                    should.append({"bool": {"must": must_np}})
-                resp = self._es.search(
-                    index=self._edges_idx,
-                    query={"bool": {"should": should, "minimum_should_match": 1}},
-                    size=min(len(batch) * per_pair, self._ES_MAX_RESULT_WINDOW),
-                )
-                for hit in resp["hits"]["hits"]:
-                    results.append(self._normalise_edge(hit["_source"]))
+                    searches_np.append({"index": self._edges_idx})
+                    searches_np.append(
+                        {"query": {"bool": {"must": must_np}}, "size": per_pair}
+                    )
+                resp = self._es.msearch(searches=searches_np)
+                for r in resp["responses"]:
+                    for hit in r.get("hits", {}).get("hits", []):
+                        results.append(self._normalise_edge(hit["_source"]))
 
         return self._apply_py_filters(results, py_filters)
 
@@ -2304,6 +2479,17 @@ class HybridMetadataBackend(MetadataBackend):
         if self._mode == "es":
             return self._es.get_edge(subject, predicate, obj)  # type: ignore[union-attr]
         return self._lmdb.get_edge(subject, predicate, obj)  # type: ignore[union-attr]
+
+    def get_edge_variants(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+    ) -> list[dict]:
+        """Route to whichever backend serves point edge lookups."""
+        if self._lmdb is not None:
+            return self._lmdb.get_edge_variants(subject, predicate, obj)
+        return self._es.get_edge_variants(subject, predicate, obj)  # type: ignore[union-attr]
 
     def nodes_by_category(
         self,

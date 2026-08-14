@@ -25,7 +25,7 @@ import time
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple, overload
+from typing import Dict, List, Literal, Optional, Sequence, Tuple, overload
 
 import numpy as np
 from metadata_db import (
@@ -1969,6 +1969,7 @@ class CSRGraph:
         db: MetadataBackend | None = ...,
         return_stats: Literal[False] = ...,
         hop_directions: Optional[List[bool]] = ...,
+        hop_extra_specs: Optional[List[Optional[EdgeSpec]]] = ...,
         subclass_depth: Optional[int] = ...,
     ) -> List[List[PathEdge]]: ...
 
@@ -1982,6 +1983,7 @@ class CSRGraph:
         *,
         return_stats: Literal[True],
         hop_directions: Optional[List[bool]] = ...,
+        hop_extra_specs: Optional[List[Optional[EdgeSpec]]] = ...,
         subclass_depth: Optional[int] = ...,
     ) -> Tuple[List[List[PathEdge]], MatchStats]: ...
 
@@ -1993,6 +1995,7 @@ class CSRGraph:
         db: MetadataBackend | None = None,
         return_stats: bool = False,
         hop_directions: Optional[List[bool]] = None,
+        hop_extra_specs: Optional[List[Optional[EdgeSpec]]] = None,
         subclass_depth: Optional[int] = None,
     ) -> List[List[PathEdge]] | Tuple[List[List[PathEdge]], MatchStats]:
         """Find all paths matching a fixed-length node/edge pattern.
@@ -2008,7 +2011,7 @@ class CSRGraph:
             When ``True`` return ``(paths, MatchStats)`` instead of just the
             paths, so callers can tell a complete result from a capped one.
             Truncation is logged as a warning either way.
-        hop_directions : list[bool], optional
+        hop_directions : list[bool | None], optional
             Per-hop edge orientation, one entry per hop.  ``True`` (the default
             for every hop) walks ``subject -> object``; ``False`` walks
             ``object -> subject``, i.e. "which nodes point at this one".  Needed
@@ -2016,6 +2019,23 @@ class CSRGraph:
             such a pattern matches nothing, since the walk would follow edges the
             wrong way.  Returned ``PathEdge`` tuples always carry the true
             ``(subject, predicate, object)`` orientation regardless.
+
+        hop_extra_specs : list[EdgeSpec | None], optional
+            Per-hop *additional* walk in the direction opposite to
+            ``hop_directions``, using its own EdgeSpec.  This is how symmetric
+            predicates are matched: Biolink declares 39 predicates symmetric
+            (``interacts_with``, ``associated_with``, ...), and for those an
+            assertion stored one way answers a query posed the other way.
+
+            It is a **separate, narrower spec** rather than a flag precisely
+            because a hop's predicate list can mix symmetric and asymmetric
+            terms.  Walking the whole hop both ways would match a one-way
+            ``treats`` edge backwards whenever any symmetric predicate shared the
+            list — asserting that a disease treats a drug.  Pass only the
+            symmetric subset here.
+
+            A node reachable both ways under the same predicate is emitted once,
+            keeping the stored orientation of the primary walk.
         path_spec : list
             Alternating ``[NodeSpec, EdgeSpec, NodeSpec, EdgeSpec, ..., NodeSpec]``.
             Length must be odd and >= 3 (at least one hop).
@@ -2102,7 +2122,19 @@ class CSRGraph:
                 f"hop_directions has {len(hop_directions)} entries for "
                 f"{len(edge_specs)} hops"
             )
-        all_forward = all(hop_directions)
+        if hop_extra_specs is None:
+            hop_extra_specs = [None] * len(edge_specs)
+        elif len(hop_extra_specs) != len(edge_specs):
+            raise ValueError(
+                f"hop_extra_specs has {len(hop_extra_specs)} entries for "
+                f"{len(edge_specs)} hops"
+            )
+
+        # The distance bound below is computed over forward topology, so it is
+        # admissible only when every hop is walked forward and nothing walks the
+        # other way.  An extra reverse walk would let branches the bound prunes
+        # still reach the target.
+        all_forward = all(hop_directions) and not any(hop_extra_specs)
 
         stats = MatchStats()
 
@@ -2173,8 +2205,12 @@ class CSRGraph:
             # neighbour found is the edge's *subject* and the frontier node is its
             # object.  Emitted PathEdges keep true orientation either way.
             forward = hop_directions[hop]
+            # An extra spec means this hop also walks the other way, restricted
+            # to those predicates.  Candidates then carry their own direction,
+            # because one batch can hold edges found each way.
+            extra_spec = hop_extra_specs[hop]
 
-            def _edge(cur: str, pred: str, nbr: str, fwd: bool = forward) -> PathEdge:
+            def _edge(cur: str, pred: str, nbr: str, fwd: bool) -> PathEdge:
                 """The edge as it exists in the graph, whichever way it was walked."""
                 return (cur, pred, nbr) if fwd else (nbr, pred, cur)
 
@@ -2204,18 +2240,20 @@ class CSRGraph:
                 if isinstance(edge_spec, dict):
                     survivors = _mp_filter_edges_batch(
                         db,
-                        [_edge(cur, pred, nbr) for cur, _p, nbr, pred in pending],
+                        [_edge(cur, pred, nbr, fwd)
+                         for cur, _p, nbr, pred, fwd in pending],
                         edge_spec,
                     )
                     pending = [
-                        c for c in pending if _edge(c[0], c[3], c[2]) in survivors
+                        c for c in pending
+                        if _edge(c[0], c[3], c[2], c[4]) in survivors
                     ]
                     if not pending:
                         return []
 
                 allowed = _mp_filter_nodes_batch(
                     db,
-                    [nbr for _c, _p, nbr, _pred in pending],
+                    [nbr for _c, _p, nbr, _pred, _f in pending],
                     next_node_spec,
                     graph=self,
                     node_subclassing=node_subclassing,
@@ -2225,8 +2263,8 @@ class CSRGraph:
                     pending = [c for c in pending if c[2] in allowed]
 
                 return [
-                    (nbr, path_so_far + [_edge(cur, pred, nbr)])
-                    for cur, path_so_far, nbr, pred in pending
+                    (nbr, path_so_far + [_edge(cur, pred, nbr, fwd)])
+                    for cur, path_so_far, nbr, pred, fwd in pending
                 ]
 
             # Candidate expansions awaiting a batched metadata check, each
@@ -2254,14 +2292,48 @@ class CSRGraph:
                     dtype=np.int64,
                     count=len(chunk),
                 )
-                src, cols, rels, labels = _mp_expand_frontier(
-                    self, chunk_idxs, edge_spec, reach_ok, reverse=not forward
+                # A symmetric hop expands both ways and unions the two; every
+                # other hop walks the single direction it was given.
+                walks = ((forward, edge_spec),)
+                if extra_spec is not None:
+                    walks = walks + ((not forward, extra_spec),)
+                src_l: List[int] = []
+                cols_l: List[int] = []
+                preds_l: List[str] = []
+                fwd_l: List[bool] = []
+                seen_sym: set[tuple[int, int, str]] | None = (
+                    set() if extra_spec is not None else None
                 )
-                # .tolist() once: indexing numpy scalars in the inner loop costs
-                # more than the conversion.
-                src_l = src.tolist()
-                cols_l = cols.tolist()
-                rels_l = rels.tolist()
+                for walk_fwd, walk_spec in walks:
+                    src, cols, rels, labels = _mp_expand_frontier(
+                        self, chunk_idxs, walk_spec, reach_ok, reverse=not walk_fwd
+                    )
+                    # Resolve the predicate label *now* rather than keeping the
+                    # relation index: each direction returns its own ``labels``
+                    # sequence, so an index kept from the forward walk would be
+                    # read against the reverse walk's labels and mislabel the
+                    # edge — which silently failed the edge-spec filter and cost
+                    # 3,607 answers on two_hop_lookup.
+                    #
+                    # .tolist() once: indexing numpy scalars in the inner loop
+                    # costs more than the conversion.
+                    for s_i, c_i, r_i in zip(
+                        src.tolist(), cols.tolist(), rels.tolist()
+                    ):
+                        pred = labels[r_i]
+                        if seen_sym is not None:
+                            # Both A->B and B->A can be stored under the same
+                            # symmetric predicate.  They assert the same
+                            # relationship, so emit one path, keeping the
+                            # forward orientation because it is walked first.
+                            key = (s_i, c_i, pred)
+                            if key in seen_sym:
+                                continue
+                            seen_sym.add(key)
+                        src_l.append(s_i)
+                        cols_l.append(c_i)
+                        preds_l.append(pred)
+                        fwd_l.append(walk_fwd)
 
                 # The flush threshold adapts to how many results this hop still
                 # needs.  Always accumulating a full batch would trade per-node
@@ -2280,9 +2352,11 @@ class CSRGraph:
                 batch_len = len(batch)
                 n_cand = len(src_l)
 
-                for k, (s, c, r) in enumerate(zip(src_l, cols_l, rels_l)):
+                for k, (s, c, pred, f) in enumerate(
+                    zip(src_l, cols_l, preds_l, fwd_l)
+                ):
                     current_node, path_so_far = chunk[s]
-                    batch.append((current_node, path_so_far, nodes[c], labels[r]))
+                    batch.append((current_node, path_so_far, nodes[c], pred, f))
 
                     batch_len += 1
 

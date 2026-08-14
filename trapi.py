@@ -54,10 +54,14 @@ Usage::
 
 from __future__ import annotations
 
+import logging
 import re
+from datetime import datetime, timezone
 from typing import Iterable, Any
 
 from csrgraph_kgx import CSRGraph, _strip_biolink
+
+logger = logging.getLogger(__name__)
 
 # Type alias for a complete binding of a query graph to concrete nodes/edges.
 # nodes: qnode_key → CURIE,  edges: qedge_key → (subject, predicate, object)
@@ -261,35 +265,36 @@ def query(
         query_graph = expand_query_graph(query_graph, expander)
         qedges = query_graph["edges"]
 
-    # Check if any edge uses symmetric predicates (needs bidirectional search).
-    has_symmetric = any(
-        any(p in SYMMETRIC_PREDICATES for p in qe.get("predicates", []))
-        for qe in qedges.values()
+    # Fast path: linearise into a chain for match_path().  Symmetric predicates
+    # used to divert here to the general matcher; match_path now walks a
+    # symmetric hop both ways itself, which matters because the backtracking
+    # matcher is an order of magnitude slower on the same shape (26.7 s against
+    # 0.33 s on the HelmsDeep two_hop_lookup).  The general matcher still owns
+    # branching and cyclic queries, and keeps its own symmetric handling.
+    try:
+        ordered_node_keys, ordered_edge_keys, hop_dirs = _linearise(
+            qnodes, qedges
+        )
+        bindings, truncated = _linear_query(
+            graph, qnodes, qedges, ordered_node_keys, ordered_edge_keys, limit,
+            hop_dirs, node_subclassing, subclass_depth,
+        )
+    except ValueError:
+        # Branching or cyclic — use the general subgraph matcher.
+        bindings, truncated = _general_match(graph, qnodes, qedges, limit)
+
+    # Post-filter pipeline: subclass validation → node constraints →
+    # edge attributes → qualifiers.
+    bindings, query_ids = _resolve_subclass_bindings(
+        graph, bindings, qnodes, node_subclassing, subclass_depth
     )
-
-    # Fast path: try to linearise into a chain for match_path().
-    # Falls back to general matcher for non-linear or symmetric queries.
-    if has_symmetric:
-        bindings = _general_match(graph, qnodes, qedges, limit)
-    else:
-        try:
-            ordered_node_keys, ordered_edge_keys, hop_dirs = _linearise(
-                qnodes, qedges
-            )
-            bindings = _linear_query(
-                graph, qnodes, qedges, ordered_node_keys, ordered_edge_keys, limit,
-                hop_dirs, node_subclassing, subclass_depth,
-            )
-        except ValueError:
-            # Branching or cyclic — use the general subgraph matcher.
-            bindings = _general_match(graph, qnodes, qedges, limit)
-
-    # Post-filter pipeline: node constraints → edge attributes → qualifiers.
     bindings = _apply_node_constraint_filters(graph, bindings, qnodes)
     bindings = _apply_edge_attribute_constraints(graph, bindings, qedges)
     bindings = _apply_qualifier_filters(graph, bindings, qedges)
 
-    return _build_message(graph, query_graph, bindings)
+    return _build_message(
+        graph, query_graph, bindings, query_ids, truncated=truncated, limit=limit
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -306,11 +311,15 @@ def _linear_query(
     hop_directions: list[bool] | None = None,
     node_subclassing: bool = False,
     subclass_depth: int | None = None,
-) -> list[Binding]:
+) -> tuple[list[Binding], bool]:
     """Execute a linear-chain query via match_path and convert to bindings.
 
     Handles multiple IDs on the start node (BATCH expansion) and multiple
     predicates per edge (wildcard + post-filter).
+
+    Returns ``(bindings, truncated)``.  ``match_path`` already computes whether a
+    hop hit its cap; this forwards it so the caller can say so in the response
+    rather than presenting a subset as if it were the whole answer.
     """
     # Determine which start IDs to iterate over (BATCH expansion).
     start_nk = ordered_node_keys[0]
@@ -324,17 +333,29 @@ def _linear_query(
         if preds and len(preds) > 1:
             multi_pred_edges[hop_idx] = set(preds)
 
-    # Collect which edges use symmetric predicates (search both directions).
-    symmetric_edges: dict[int, bool] = {}
-    for hop_idx, ek in enumerate(ordered_edge_keys):
-        preds = qedges[ek].get("predicates") or []
-        if any(p in SYMMETRIC_PREDICATES for p in preds):
-            symmetric_edges[hop_idx] = True
+    # Symmetric predicates are direction-free: an assertion stored one way
+    # answers a query posed the other way.  Each hop gets an *extra* walk in the
+    # opposite direction restricted to its symmetric predicates only.
+    #
+    # Restricted, not the whole hop: a predicate list can mix symmetric and
+    # asymmetric terms, and walking all of them backwards matched a one-way
+    # ``treats`` edge in reverse whenever any symmetric predicate shared the
+    # list.  With Biolink expansion this is the common case, not a corner one —
+    # ``biolink:associated_with`` expands to 24 predicates of which only 8 are
+    # symmetric.
+    hop_extra_specs: list[tuple[str, ...] | None] = []
+    for ek in ordered_edge_keys:
+        sym = [p for p in (qedges[ek].get("predicates") or [])
+               if p in SYMMETRIC_PREDICATES]
+        hop_extra_specs.append(tuple(sym) if sym else None)
 
     bindings: list[Binding] = []
+    truncated = False
 
     for start_id in start_ids:
         if len(bindings) >= limit:
+            # Start IDs left unprocessed, so some batch members never ran.
+            truncated = True
             break
 
         # Build path_spec, substituting the start ID for this iteration.
@@ -342,11 +363,27 @@ def _linear_query(
             ordered_node_keys, ordered_edge_keys, qnodes, qedges,
             start_id_override=start_id,
         )
+        # The nodes match_path started this iteration from, so a path can be
+        # anchored at its known end regardless of how each edge is oriented.
+        start_set: set[str] | None = None
+        if start_id is not None and start_id in graph.node_to_id:
+            if node_subclassing:
+                start_set = {
+                    graph.nodes[i] for i in graph._expand_subclasses(
+                        graph.node_to_id[start_id], subclass_depth
+                    )
+                }
+            else:
+                start_set = {start_id}
+
         remaining = limit - len(bindings)
-        raw_paths = graph.match_path(
+        raw_paths, stats = graph.match_path(
             path_spec, limit=remaining, hop_directions=hop_directions,
+            hop_extra_specs=hop_extra_specs,
             node_subclassing=node_subclassing, subclass_depth=subclass_depth,
+            return_stats=True,
         )
+        truncated = truncated or stats.truncated
 
         for path in raw_paths:
             nodes: dict[str, str] = {}
@@ -354,14 +391,26 @@ def _linear_query(
 
             if path:
                 dirs = hop_directions or [True] * len(path)
-                # A reverse hop stores (neighbour, pred, frontier_node), so the
-                # chain positions are swapped relative to a forward hop.
+                # Walk the chain by shared endpoint rather than by hop
+                # direction.  Direction alone is wrong once a hop can also be
+                # walked the other way for its symmetric predicates: such an
+                # edge comes back in true (subject, predicate, object) order,
+                # which is the *opposite* of what the hop's direction implies,
+                # and reading it by direction swapped the two endpoints — a
+                # query pinned to one gene returned the other one bound in its
+                # place.
                 first_subj, _, first_obj = path[0]
-                nodes[ordered_node_keys[0]] = first_subj if dirs[0] else first_obj
+                if start_set is not None:
+                    cur = first_subj if first_subj in start_set else first_obj
+                else:
+                    # Open start node: nothing to anchor on, so fall back to the
+                    # declared direction.
+                    cur = first_subj if dirs[0] else first_obj
+                nodes[ordered_node_keys[0]] = cur
                 for hop_idx, (subj, _, obj) in enumerate(path):
-                    nodes[ordered_node_keys[hop_idx + 1]] = (
-                        obj if dirs[hop_idx] else subj
-                    )
+                    nxt = obj if subj == cur else subj
+                    nodes[ordered_node_keys[hop_idx + 1]] = nxt
+                    cur = nxt
 
             # Post-filter: check multi-predicate edges.
             skip = False
@@ -380,7 +429,7 @@ def _linear_query(
             if len(bindings) >= limit:
                 break
 
-    return bindings
+    return bindings, truncated
 
 
 class BiolinkExpander:
@@ -650,8 +699,12 @@ def _general_match(
     qnodes: dict[str, dict],
     qedges: dict[str, dict],
     limit: int,
-) -> list[Binding]:
+) -> tuple[list[Binding], bool]:
     """Find all subgraph bindings matching an arbitrary query graph pattern.
+
+    Returns ``(bindings, truncated)``; *truncated* is True when the search
+    stopped because *limit* was reached, so a caller can tell an exhaustive
+    answer from a partial one.
 
     Uses backtracking search:
     1. Pick the most constrained unbound QNode adjacent to a bound QNode.
@@ -678,9 +731,13 @@ def _general_match(
     start_key = min(qnodes, key=_start_score)
     start_candidates = _get_candidates(graph, db, qnodes[start_key])
     if not start_candidates:
-        return []
+        return [], False
 
     results: list[Binding] = []
+    # Set when the search stops because *limit* was reached, so the caller can
+    # tell a complete answer from a truncated one.  match_path reports the same
+    # thing via MatchStats; this matcher previously reported nothing at all.
+    truncated = False
 
     def _backtrack(
         node_bindings: dict[str, str],
@@ -760,10 +817,26 @@ def _general_match(
                 return
 
         # Filter candidates by QNode constraints.
-        candidates = _filter_by_qnode(graph, db, qnodes[next_key], list(candidates))
+        #
+        # ``sorted``, not ``list``: *candidates* is a set of CURIE **strings**,
+        # and Python randomises ``str.__hash__`` per process, so ``list(...)``
+        # yields a different order on every run.  That order decides which
+        # candidates are explored before ``len(results) >= limit`` stops the
+        # search, so an identical query returned different answers run to run —
+        # measured on the HelmsDeep ``two_hop_lookup`` as three different genes
+        # across three runs, and stable under ``PYTHONHASHSEED=0``.
+        #
+        # ``match_path`` never had this problem because it works in CSR index
+        # space, where the sets hold ``int`` node indices and ``int.__hash__``
+        # is identity.  Sorting by CURIE rather than node index is deliberate:
+        # index order depends on KGX ingest order, so it would not survive a
+        # graph rebuild, whereas CURIEs do.
+        candidates = _filter_by_qnode(graph, db, qnodes[next_key], sorted(candidates))
 
         for curie in candidates:
             if len(results) >= limit:
+                nonlocal truncated
+                truncated = True
                 return
             # Bind this node and all connecting edges.
             node_bindings[next_key] = curie
@@ -793,10 +866,18 @@ def _general_match(
     # Launch search from each start candidate.
     for curie in start_candidates:
         if len(results) >= limit:
+            # Start candidates left unexplored: the answer is a subset.
+            truncated = True
             break
         _backtrack({start_key: curie}, {})
 
-    return results
+    if truncated:
+        logger.warning(
+            "_general_match stopped at limit=%d: returning %d binding(s), which "
+            "is a subset of the matches. Raise limit= for a complete result.",
+            limit, len(results),
+        )
+    return results, truncated
 
 
 def _get_candidates(
@@ -932,13 +1013,22 @@ def _matching_predicates(
     actual_preds = graph.edges_between(source, target)
 
     allowed = qedge.get("predicates")
-    has_symmetric = allowed and any(p in SYMMETRIC_PREDICATES for p in allowed)
+    symmetric_allowed = {p for p in (allowed or []) if p in SYMMETRIC_PREDICATES}
 
-    # Also check reverse for symmetric predicates.
-    if has_symmetric:
-        reverse_preds = graph.edges_between(target, source)
-        # Combine, marking reverse preds (they still match for symmetric).
-        actual_preds = list(set(actual_preds) | set(reverse_preds))
+    # Reverse-direction edges count only for the symmetric predicates.  Taking
+    # every reverse edge whenever *any* allowed predicate was symmetric matched
+    # one-way edges backwards: a query for [treats, interacts_with] returned a
+    # stored ``C treats D`` as though ``D treats C``.
+    if symmetric_allowed:
+        reverse_preds = [
+            p for p in graph.edges_between(target, source)
+            if p in symmetric_allowed
+        ]
+        # Sorted for the same reason as the candidate set: callers take
+        # ``preds[0]`` as *the* predicate for the edge binding, so iterating a
+        # string set here made which predicate got reported vary between runs
+        # even when nothing was truncated.
+        actual_preds = sorted(set(actual_preds) | set(reverse_preds))
 
     if not actual_preds:
         return []
@@ -1171,12 +1261,16 @@ def _apply_edge_attribute_constraints(
                 keep = False
                 break
             subj, pred, obj = edge
-            edge_meta = db.get_edge(subj, pred, obj)
-            for ac in constraints:
-                if not _eval_constraint(edge_meta, ac):
-                    keep = False
-                    break
-            if not keep:
+            # The same triple can be stored several times with different
+            # qualifiers/attributes; the constraint is met if *any* of those
+            # variants meets it.  Reading a single record silently dropped
+            # answers whose matching variant was not the one kept.
+            variants = db.get_edge_variants(subj, pred, obj) or [{}]
+            if not any(
+                all(_eval_constraint(v, ac) for ac in constraints)
+                for v in variants
+            ):
+                keep = False
                 break
         if keep:
             filtered.append(binding)
@@ -1215,8 +1309,10 @@ def _apply_qualifier_filters(
                 keep = False
                 break
             subj, pred, obj = edge
-            edge_meta = db.get_edge(subj, pred, obj)
-            if not _matches_any_qualifier_set(edge_meta, qualifier_sets):
+            variants = db.get_edge_variants(subj, pred, obj) or [{}]
+            if not any(
+                _matches_any_qualifier_set(v, qualifier_sets) for v in variants
+            ):
                 keep = False
                 break
         if keep:
@@ -1251,12 +1347,98 @@ def _matches_qualifier_set(edge_meta: dict, qualifiers: list[dict]) -> bool:
 # TRAPI response assembly (works with bindings from both paths)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _resolve_subclass_bindings(
+    graph: CSRGraph,
+    bindings: list[Binding],
+    qnodes: dict[str, dict],
+    node_subclassing: bool,
+    subclass_depth: int | None,
+) -> tuple[list[Binding], dict[str, dict[str, str]]]:
+    """Validate subclass-expanded bindings and record what each was queried as.
+
+    ``match_path`` expands a pinned node to its ``subclass_of`` descendants and
+    binds the descendant directly, and nothing downstream re-examined it.  Two
+    consequences, both measured on the HelmsDeep ``batch_lookup`` query:
+
+    * **The descendant never faced the QNode's ``categories``.** This graph
+      asserts ``HP:x subclass_of MONDO:y``, so a query pinned to diseases *and
+      constrained to* ``biolink:Disease`` bound six ``PhenotypicFeature`` nodes
+      (``HP:0000978`` "Easy Bruising" among them).  Those answers contradict the
+      query, which is worse than missing ones, so they are dropped here.
+    * **A descendant is not the CURIE the caller asked for.** TRAPI says so with
+      ``NodeBinding.query_id``; without it a client cannot distinguish a subtype
+      match from a direct hit.  The returned map supplies it.
+
+    Only the *expanded* CURIEs are checked, not every bound node: open nodes were
+    already category-filtered during enumeration, so re-validating them would add
+    a large batched backend call per query node and find nothing.
+    """
+    if not bindings:
+        return bindings, {}
+
+    db = graph.db
+    query_ids: dict[str, dict[str, str]] = {}
+    drop: dict[str, set[str]] = {}
+
+    for nk, qn in qnodes.items():
+        ids = qn.get("ids")
+        if not ids or not node_subclassing:
+            continue
+        bound = {b["nodes"][nk] for b in bindings if nk in b["nodes"]}
+        expanded = bound - set(ids)
+        if not expanded:
+            continue
+
+        # Which queried CURIE did each descendant come from?  Expand the same
+        # way match_path did so the two agree.
+        mapping: dict[str, str] = {}
+        for qid in ids:
+            if qid not in graph.node_to_id:
+                continue
+            for i in graph._expand_subclasses(graph.node_to_id[qid], subclass_depth):
+                curie = graph.nodes[i]
+                if curie in expanded:
+                    mapping.setdefault(curie, qid)
+        if mapping:
+            query_ids[nk] = mapping
+
+        categories = qn.get("categories")
+        if categories:
+            ok: set[str] = set()
+            for cat in categories:
+                ok.update(
+                    m["id"] for m in db.filter_nodes(sorted(expanded), category=cat)
+                )
+            bad = expanded - ok
+            if bad:
+                drop[nk] = bad
+
+    if drop:
+        bindings = [
+            b for b in bindings
+            if not any(b["nodes"].get(k) in bad for k, bad in drop.items())
+        ]
+
+    return bindings, query_ids
+
+
 def _build_message(
     graph: CSRGraph,
     query_graph: dict,
     bindings: list[Binding],
+    query_ids: dict[str, dict[str, str]] | None = None,
+    *,
+    truncated: bool = False,
+    limit: int | None = None,
 ) -> dict:
-    """Assemble a TRAPI Message from bindings."""
+    """Assemble a TRAPI Message from bindings.
+
+    When *truncated*, a ``message.logs`` entry records that the result set is a
+    subset.  A client cannot otherwise distinguish "these are all the answers"
+    from "these are the first *limit* of them", and the two mean very different
+    things: with constraints applied after the cap, a constrained query can
+    return far fewer answers than exist.
+    """
     db = graph.db
     kg_nodes: dict[str, dict] = {}
     kg_edges: dict[str, dict] = {}
@@ -1272,7 +1454,13 @@ def _build_message(
         edge_bindings: dict[str, list[dict]] = {}
 
         for nk, curie in binding["nodes"].items():
-            node_bindings[nk] = [{"id": curie, "attributes": []}]
+            nb: dict[str, Any] = {"id": curie, "attributes": []}
+            # A subclass-expanded node is not the CURIE that was asked for, so
+            # say which one it stands in for.
+            queried = (query_ids or {}).get(nk, {}).get(curie)
+            if queried is not None:
+                nb["query_id"] = queried
+            node_bindings[nk] = [nb]
             if curie not in kg_nodes:
                 kg_nodes[curie] = _make_kg_node(db, curie)
 
@@ -1294,7 +1482,7 @@ def _build_message(
             }],
         })
 
-    return {
+    message: dict[str, Any] = {
         "query_graph": query_graph,
         "knowledge_graph": {
             "nodes": kg_nodes,
@@ -1302,6 +1490,18 @@ def _build_message(
         },
         "results": results,
     }
+    if truncated:
+        message["logs"] = [{
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": "WARNING",
+            "code": "ResultsTruncated",
+            "message": (
+                f"Result set is incomplete: enumeration stopped at limit="
+                f"{limit}, returning {len(results)} result(s). Raise the limit "
+                f"for a complete answer."
+            ),
+        }]
+    return message
 
 
 def _make_kg_node(db: Any, curie: str) -> dict:

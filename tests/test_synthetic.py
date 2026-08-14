@@ -324,3 +324,149 @@ def test_sqlite_backend_match_path(archive: Path, tmp_path: Path):
         assert any(p[-1][-1] == "MONDO:1" for p in paths)
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Qualifier variants: the same triple asserted twice with different qualifiers
+# ---------------------------------------------------------------------------
+
+_VARIANT_NODES = [
+    {"id": "CHEBI:V", "name": "DrugV", "category": ["biolink:SmallMolecule"]},
+    {"id": "NCBIGene:V", "name": "GeneV", "category": ["biolink:Gene"]},
+]
+# One triple, two contradictory assertions -- exactly the shape that a store keyed
+# on (subject, predicate, object) alone collapses into one, losing answers.
+_VARIANT_EDGES = [
+    {"subject": "CHEBI:V", "predicate": "biolink:affects", "object": "NCBIGene:V",
+     "object_direction_qualifier": "decreased", "causal_mechanism_qualifier": "inhibition"},
+    {"subject": "CHEBI:V", "predicate": "biolink:affects", "object": "NCBIGene:V",
+     "object_direction_qualifier": "increased", "causal_mechanism_qualifier": "agonism"},
+    {"subject": "CHEBI:V", "predicate": "biolink:treats", "object": "NCBIGene:V"},
+]
+
+
+@pytest.fixture
+def variant_archive(tmp_path: Path) -> Path:
+    nb = ("\n".join(json.dumps(n) for n in _VARIANT_NODES)).encode()
+    eb = ("\n".join(json.dumps(e) for e in _VARIANT_EDGES)).encode()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, data in [("nodes.jsonl", nb), ("edges.jsonl", eb)]:
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tar.addfile(ti, io.BytesIO(data))
+    p = tmp_path / "variants.tar.zst"
+    p.write_bytes(_zstd_compress(buf.getvalue()))
+    return p
+
+
+def test_qualifier_fingerprint_properties():
+    from metadata_db import qualifier_fingerprint as fp
+
+    # Unqualified edges get an empty suffix, so the ~99% single-variant case
+    # pays one byte rather than a hash.
+    assert fp({"subject": "a", "predicate": "p", "object": "b"}) == ""
+    # Content-derived and order-independent, so it is stable across rebuilds.
+    assert fp({"a_qualifier": "1", "b_qualifier": "2"}) == fp({"b_qualifier": "2", "a_qualifier": "1"})
+    # Differing qualifiers must separate.
+    assert fp({"object_direction_qualifier": "increased"}) != fp(
+        {"object_direction_qualifier": "decreased"}
+    )
+    # Non-qualifier fields are ignored: they never distinguished duplicates.
+    assert fp({"object_direction_qualifier": "increased", "sources": ["x"]}) == fp(
+        {"object_direction_qualifier": "increased", "sources": ["y"]}
+    )
+
+
+def test_base_backend_variant_default_returns_at_most_one():
+    """Backends without variant storage (SQLite, DuckDB) still satisfy the API."""
+    from metadata_db import MetadataBackend
+
+    class _Single(MetadataBackend):
+        def get_node(self, node_id):
+            return {}
+
+        def get_edge(self, subject, predicate, obj):
+            return {"subject": subject, "predicate": predicate, "object": obj}
+
+        def filter_nodes(self, node_ids, *, category=None, extra_filters=None):
+            return []
+
+        def filter_edges(self, edges, *, knowledge_level=None, agent_type=None,
+                         extra_filters=None):
+            return []
+
+        def close(self):
+            pass
+
+    assert len(_Single().get_edge_variants("a", "biolink:p", "b")) == 1
+
+
+def test_lmdb_stores_every_qualifier_variant(variant_archive: Path, tmp_path: Path):
+    from metadata_db import LMDBMetadataBackend
+
+    db = LMDBMetadataBackend.build(
+        str(variant_archive), str(tmp_path / "v.lmdb"),
+        node_metadata_fields=["all"], edge_metadata_fields=["all"],
+    )
+    try:
+        variants = db.get_edge_variants("CHEBI:V", "biolink:affects", "NCBIGene:V")
+        assert len(variants) == 2, "both assertions must survive the build"
+        pairs = {(v.get("object_direction_qualifier"),
+                  v.get("causal_mechanism_qualifier")) for v in variants}
+        assert pairs == {("decreased", "inhibition"), ("increased", "agonism")}
+
+        # get_edge still answers with one, deterministically.
+        assert db.get_edge("CHEBI:V", "biolink:affects", "NCBIGene:V") in variants
+        first = db.get_edge("CHEBI:V", "biolink:affects", "NCBIGene:V")
+        assert db.get_edge("CHEBI:V", "biolink:affects", "NCBIGene:V") == first
+
+        # An unqualified triple is unaffected.
+        assert len(db.get_edge_variants("CHEBI:V", "biolink:treats", "NCBIGene:V")) == 1
+
+        # filter_edges surfaces both variants, and the no-predicate branch still
+        # works now that keys carry a fourth component.
+        assert len(db.filter_edges([("CHEBI:V", "biolink:affects", "NCBIGene:V")])) == 2
+        assert len(db.filter_edges([("CHEBI:V", None, "NCBIGene:V")])) == 3
+    finally:
+        db.close()
+
+
+def test_qualifier_correlation_is_preserved(variant_archive: Path, tmp_path: Path):
+    """Cross-combinations must NOT match.
+
+    Merging qualifiers into per-field lists would make (decreased, agonism) match
+    even though no single assertion says that — trading missing answers for wrong
+    ones. Storing whole variants keeps each assertion's fields correlated.
+    """
+    import trapi
+    from metadata_db import LMDBMetadataBackend
+
+    g = CSRGraph.from_kgx_archive(str(variant_archive))
+    db = LMDBMetadataBackend.build(
+        str(variant_archive), str(tmp_path / "v2.lmdb"),
+        node_metadata_fields=["all"], edge_metadata_fields=["all"],
+    )
+    g.set_db(db)
+    try:
+        def ask(direction, mechanism):
+            qg = {
+                "nodes": {"n0": {"ids": ["CHEBI:V"]}, "n1": {"ids": ["NCBIGene:V"]}},
+                "edges": {"e0": {
+                    "subject": "n0", "object": "n1",
+                    "predicates": ["biolink:affects"],
+                    "qualifier_constraints": [{"qualifier_set": [
+                        {"qualifier_type_id": "biolink:object_direction_qualifier",
+                         "qualifier_value": direction},
+                        {"qualifier_type_id": "biolink:causal_mechanism_qualifier",
+                         "qualifier_value": mechanism},
+                    ]}]}},
+            }
+            return len(trapi.query(g, qg, limit=10)["results"])
+
+        assert ask("decreased", "inhibition") == 1      # asserted
+        assert ask("increased", "agonism") == 1         # asserted
+        assert ask("decreased", "agonism") == 0         # never asserted
+        assert ask("increased", "inhibition") == 0      # never asserted
+    finally:
+        db.close()
