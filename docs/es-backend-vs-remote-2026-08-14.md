@@ -113,3 +113,38 @@ the right keyword-only pushdown set (`name` correctly excluded as analysed text)
 
 So the backend can read a Translator ES index it did not build. That is worth
 knowing for deployment: the metadata store need not be ours.
+
+## Addendum: re-verified on the full 3-node cluster
+
+Port 9201 was restored to `es02`, so the local figures above — taken on two of
+three nodes while an AWS load balancer occupied 9201 — were re-measured against
+the complete cluster.
+
+**Node count made no measurable difference.** Three repeats of each configuration,
+same fixtures:
+
+| operation | 2-node range | 3-node range |
+| --- | --- | --- |
+| `get_node` ×50 | 49.8 – 59.2 ms | 51.7 – 64.3 ms |
+| `get_edge` ×50 | 40.8 – 48.7 ms | 43.0 – 51.6 ms |
+| `get_edge_variants` ×50 | 98.2 – 118.3 ms | 104.1 – 119.7 ms |
+| `filter_nodes` (100) | 3.32 – 3.69 ms | 3.34 – 3.68 ms |
+| `filter_edges` (100) | 12.5 – 20.9 ms | 13.5 – 15.6 ms |
+| `nodes_by_category` | 44.3 – 44.7 ms | 44.9 – 45.8 ms |
+
+Every range overlaps. The first 3-node sample read 68.9 ms on `get_node`, the
+highest of seven runs, and settled once `es02` warmed — a freshly restarted node
+is cold, not slow. The numbers in the table above sit inside these ranges and
+stand as recorded.
+
+Two things follow. Adding a third coordinating node does **not** speed these
+operations up: a point lookup is routed to whichever node holds the shard
+regardless of which one receives it, so more entry points buy nothing on this
+workload — they matter for concurrency, which is measured separately in
+`docs/concurrency-and-scalability-2026-07-19.md`.
+
+And run-to-run variance on the point operations is roughly **±20%**, so the
+`prod ÷ local` ratios should be read as order-of-magnitude, not to two
+significant figures. The conclusion is unaffected: it rests on the pooled
+per-request floor (0.69 ms against 28.85 ms), which is a far larger and much more
+stable difference than this noise.
