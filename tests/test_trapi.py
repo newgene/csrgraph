@@ -1416,16 +1416,38 @@ class TestSymmetricHops:
         assert self._ask(graph, "C:1", "D:1", "biolink:treats")[0] == 1
         assert self._ask(graph, "D:1", "C:1", "biolink:treats")[0] == 0
 
-    def test_symmetric_hop_unions_both_directions(self, graph):
-        """match_path with a None hop returns forward and reverse together."""
+    def test_extra_spec_unions_both_directions(self, graph):
+        """An extra spec adds the opposite-direction walk to the primary one."""
         graph.set_db(_StubDB())
         spec = ["C:1", "biolink:interacts_with", None]
         fwd = graph.match_path(spec, limit=10, hop_directions=[True])
         rev = graph.match_path(spec, limit=10, hop_directions=[False])
-        both = graph.match_path(spec, limit=10, hop_directions=[None])
+        both = graph.match_path(
+            spec, limit=10, hop_directions=[True],
+            hop_extra_specs=[("biolink:interacts_with",)],
+        )
         assert {p[0] for p in fwd} == {("C:1", "biolink:interacts_with", "C:2")}
         assert {p[0] for p in rev} == {("C:3", "biolink:interacts_with", "C:1")}
         assert {p[0] for p in both} == {p[0] for p in fwd} | {p[0] for p in rev}
+
+    def test_extra_spec_covers_only_the_predicates_it_names(self, graph):
+        """A one-way predicate is not dragged along by a symmetric sibling.
+
+        The hop lists both, but only interacts_with may be walked backwards;
+        matching treats in reverse would assert that a disease treats a drug.
+        """
+        from trapi import query
+
+        graph.set_db(_StubDB())
+        qg = {"nodes": {"n0": {"ids": ["D:1"]}, "n1": {"ids": ["C:1"]}},
+              "edges": {"e0": {"subject": "n0", "object": "n1",
+                               "predicates": ["biolink:treats",
+                                              "biolink:interacts_with"]}}}
+        msg = query(graph, qg, limit=10, node_subclassing=False)
+        assert len(msg["results"]) == 0, (
+            "a one-way treats edge matched backwards because a symmetric "
+            "predicate shared the hop"
+        )
 
     def test_both_orientations_stored_yields_one_path(self):
         """A pair asserted both ways under one symmetric predicate is one answer."""
@@ -1437,7 +1459,8 @@ class TestSymmetricHops:
         ])
         g.set_db(_StubDB())
         paths = g.match_path(["C:1", "biolink:interacts_with", None],
-                             limit=10, hop_directions=[None])
+                             limit=10, hop_directions=[True],
+                             hop_extra_specs=[("biolink:interacts_with",)])
         assert len(paths) == 1, f"duplicate assertion emitted twice: {paths}"
         # Forward is walked first, so its orientation is the one kept.
         assert paths[0][0] == ("C:1", "biolink:interacts_with", "C:2")

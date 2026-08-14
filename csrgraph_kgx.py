@@ -1968,7 +1968,8 @@ class CSRGraph:
         node_subclassing: bool = ...,
         db: MetadataBackend | None = ...,
         return_stats: Literal[False] = ...,
-        hop_directions: Optional[List[Optional[bool]]] = ...,
+        hop_directions: Optional[List[bool]] = ...,
+        hop_extra_specs: Optional[List[Optional[EdgeSpec]]] = ...,
         subclass_depth: Optional[int] = ...,
     ) -> List[List[PathEdge]]: ...
 
@@ -1981,7 +1982,8 @@ class CSRGraph:
         db: MetadataBackend | None = ...,
         *,
         return_stats: Literal[True],
-        hop_directions: Optional[List[Optional[bool]]] = ...,
+        hop_directions: Optional[List[bool]] = ...,
+        hop_extra_specs: Optional[List[Optional[EdgeSpec]]] = ...,
         subclass_depth: Optional[int] = ...,
     ) -> Tuple[List[List[PathEdge]], MatchStats]: ...
 
@@ -1992,7 +1994,8 @@ class CSRGraph:
         node_subclassing: bool = False,
         db: MetadataBackend | None = None,
         return_stats: bool = False,
-        hop_directions: Optional[List[Optional[bool]]] = None,
+        hop_directions: Optional[List[bool]] = None,
+        hop_extra_specs: Optional[List[Optional[EdgeSpec]]] = None,
         subclass_depth: Optional[int] = None,
     ) -> List[List[PathEdge]] | Tuple[List[List[PathEdge]], MatchStats]:
         """Find all paths matching a fixed-length node/edge pattern.
@@ -2017,15 +2020,22 @@ class CSRGraph:
             wrong way.  Returned ``PathEdge`` tuples always carry the true
             ``(subject, predicate, object)`` orientation regardless.
 
-            ``None`` marks a **symmetric** hop and walks both ways, unioned.
-            Biolink declares 39 predicates symmetric (``interacts_with``,
-            ``associated_with``, ...), and for those an assertion stored one way
-            answers a query posed the other way.  Without this, symmetric queries
-            had to fall back to the general subgraph matcher, which costs an
-            order of magnitude: on the HelmsDeep ``two_hop_lookup`` shape this
-            path takes 0.33 s where the backtracking matcher takes 26.7 s.
+        hop_extra_specs : list[EdgeSpec | None], optional
+            Per-hop *additional* walk in the direction opposite to
+            ``hop_directions``, using its own EdgeSpec.  This is how symmetric
+            predicates are matched: Biolink declares 39 predicates symmetric
+            (``interacts_with``, ``associated_with``, ...), and for those an
+            assertion stored one way answers a query posed the other way.
+
+            It is a **separate, narrower spec** rather than a flag precisely
+            because a hop's predicate list can mix symmetric and asymmetric
+            terms.  Walking the whole hop both ways would match a one-way
+            ``treats`` edge backwards whenever any symmetric predicate shared the
+            list — asserting that a disease treats a drug.  Pass only the
+            symmetric subset here.
+
             A node reachable both ways under the same predicate is emitted once,
-            keeping the stored orientation of the forward edge.
+            keeping the stored orientation of the primary walk.
         path_spec : list
             Alternating ``[NodeSpec, EdgeSpec, NodeSpec, EdgeSpec, ..., NodeSpec]``.
             Length must be odd and >= 3 (at least one hop).
@@ -2112,11 +2122,19 @@ class CSRGraph:
                 f"hop_directions has {len(hop_directions)} entries for "
                 f"{len(edge_specs)} hops"
             )
-        # Only an all-forward walk may use the distance bound below, which is
-        # computed over forward topology.  A symmetric hop (``None``) is not
-        # forward, so it correctly disables the bound rather than pruning
-        # branches that the reverse direction could still reach.
-        all_forward = all(d is True for d in hop_directions)
+        if hop_extra_specs is None:
+            hop_extra_specs = [None] * len(edge_specs)
+        elif len(hop_extra_specs) != len(edge_specs):
+            raise ValueError(
+                f"hop_extra_specs has {len(hop_extra_specs)} entries for "
+                f"{len(edge_specs)} hops"
+            )
+
+        # The distance bound below is computed over forward topology, so it is
+        # admissible only when every hop is walked forward and nothing walks the
+        # other way.  An extra reverse walk would let branches the bound prunes
+        # still reach the target.
+        all_forward = all(hop_directions) and not any(hop_extra_specs)
 
         stats = MatchStats()
 
@@ -2187,10 +2205,10 @@ class CSRGraph:
             # neighbour found is the edge's *subject* and the frontier node is its
             # object.  Emitted PathEdges keep true orientation either way.
             forward = hop_directions[hop]
-            # ``None`` means symmetric: walk both ways and union the results.
-            # Candidates then carry their own direction, because one batch can
-            # hold edges found each way.
-            symmetric = forward is None
+            # An extra spec means this hop also walks the other way, restricted
+            # to those predicates.  Candidates then carry their own direction,
+            # because one batch can hold edges found each way.
+            extra_spec = hop_extra_specs[hop]
 
             def _edge(cur: str, pred: str, nbr: str, fwd: bool) -> PathEdge:
                 """The edge as it exists in the graph, whichever way it was walked."""
@@ -2276,17 +2294,19 @@ class CSRGraph:
                 )
                 # A symmetric hop expands both ways and unions the two; every
                 # other hop walks the single direction it was given.
-                walks = (True, False) if symmetric else (forward,)
+                walks = ((forward, edge_spec),)
+                if extra_spec is not None:
+                    walks = walks + ((not forward, extra_spec),)
                 src_l: List[int] = []
                 cols_l: List[int] = []
                 preds_l: List[str] = []
                 fwd_l: List[bool] = []
                 seen_sym: set[tuple[int, int, str]] | None = (
-                    set() if symmetric else None
+                    set() if extra_spec is not None else None
                 )
-                for walk_fwd in walks:
+                for walk_fwd, walk_spec in walks:
                     src, cols, rels, labels = _mp_expand_frontier(
-                        self, chunk_idxs, edge_spec, reach_ok, reverse=not walk_fwd
+                        self, chunk_idxs, walk_spec, reach_ok, reverse=not walk_fwd
                     )
                     # Resolve the predicate label *now* rather than keeping the
                     # relation index: each direction returns its own ``labels``

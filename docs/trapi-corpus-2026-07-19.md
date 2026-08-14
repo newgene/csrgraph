@@ -529,13 +529,12 @@ reachability pruning. Measured on the `two_hop_lookup` shape:
 
 That was the entire explanation for the one benchmark gandalf won.
 
-`match_path` now accepts a hop direction of `None`, meaning symmetric: it walks
-both ways and unions the results, tagging each candidate with the direction it
-came from so emitted edges keep their true stored orientation. `_linear_query`
-sets `None` for hops whose predicates include a symmetric one — reviving a
-`symmetric_edges` dict that had been computed and never read — and `query()` no
-longer diverts. `_general_match` keeps its own symmetric handling for branching
-and cyclic queries.
+`match_path` now takes `hop_extra_specs`: a per-hop *additional* walk in the
+opposite direction, with **its own, narrower EdgeSpec**. `_linear_query` fills it
+with just the symmetric predicates of that hop, and `query()` no longer diverts.
+`_general_match` keeps its own handling for branching and cyclic queries.
+
+The narrower spec is the whole point — see "symmetry is per predicate" below.
 
 ### Result
 
@@ -567,3 +566,51 @@ rest.
   hits a fixed `limit` sooner: at `limit=100000` this query truncated to 43,292
   results and 309 genes, which the `ResultsTruncated` log now reports. Raising the
   limit recovers the full 547.
+
+
+### Symmetry is per predicate, not per hop
+
+The first version of this marked a whole hop symmetric when *any* of its
+predicates was, and walked the entire hop both ways. That is wrong, and it
+produced wrong answers rather than missing ones:
+
+```
+stored:  C:1 -treats-> D:1          (treats is NOT symmetric)
+query:   D:1 -[treats]-> C:1                      -> 0 results  correct
+query:   D:1 -[treats, interacts_with]-> C:1      -> 1 result   WRONG
+```
+
+The one-way `treats` edge matched backwards — asserting a disease treats a drug —
+because a symmetric predicate happened to share the list.
+
+This is not a corner case under Biolink expansion: `biolink:associated_with`
+expands to **24 predicates of which only 8 are symmetric**. The other 16
+(`biomarker_for`, `condition_associated_with_gene`,
+`associated_with_resistance_to`, ...) were all being walked backwards.
+
+**The same defect was already present in `_general_match`**, independently of
+this work: `_matching_predicates` took *every* reverse-direction edge whenever
+any allowed predicate was symmetric, then kept whichever matched the allowed
+list — including the asymmetric ones. Both are fixed: the reverse walk is
+restricted to the symmetric subset.
+
+Fixing it exposed a third bug. `_linear_query` reconstructed node bindings from
+the *hop direction*, but an edge found by the opposite-direction walk comes back
+in true `(subject, predicate, object)` order — the opposite of what the hop
+direction implies — so the two endpoints were **swapped**. A query pinned to one
+gene returned the other bound in its place. Bindings are now chained by shared
+endpoint, anchored on the set of nodes `match_path` actually started from
+(subclass expansion included), which is orientation-independent.
+
+### Final state
+
+| `two_hop_lookup` | before | after | gandalf |
+| --- | --- | --- | --- |
+| time | 26,665 ms | **1,911 ms** | 3,461 ms |
+| `n0` | 12,892 | 12,892 | 12,892 (equal) |
+| `n1` | 547 | 547 | 547 (equal) |
+
+`n0` and `n1` are set-equal to gandalf. The `n2` difference (7 vs 1) is the
+subclass `query_id` representation shared with every other differing row —
+`match_path` expands a pinned start node where `_general_match` did not, so this
+query now behaves like the rest. Every other corpus row is unchanged.

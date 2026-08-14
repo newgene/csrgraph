@@ -334,16 +334,20 @@ def _linear_query(
             multi_pred_edges[hop_idx] = set(preds)
 
     # Symmetric predicates are direction-free: an assertion stored one way
-    # answers a query posed the other way.  ``None`` tells match_path to walk
-    # that hop both ways.  This dict was previously computed and never read.
-    if hop_directions is not None:
-        hop_directions = [
-            None
-            if any(p in SYMMETRIC_PREDICATES
-                   for p in (qedges[ek].get("predicates") or []))
-            else fwd
-            for fwd, ek in zip(hop_directions, ordered_edge_keys)
-        ]
+    # answers a query posed the other way.  Each hop gets an *extra* walk in the
+    # opposite direction restricted to its symmetric predicates only.
+    #
+    # Restricted, not the whole hop: a predicate list can mix symmetric and
+    # asymmetric terms, and walking all of them backwards matched a one-way
+    # ``treats`` edge in reverse whenever any symmetric predicate shared the
+    # list.  With Biolink expansion this is the common case, not a corner one —
+    # ``biolink:associated_with`` expands to 24 predicates of which only 8 are
+    # symmetric.
+    hop_extra_specs: list[tuple[str, ...] | None] = []
+    for ek in ordered_edge_keys:
+        sym = [p for p in (qedges[ek].get("predicates") or [])
+               if p in SYMMETRIC_PREDICATES]
+        hop_extra_specs.append(tuple(sym) if sym else None)
 
     bindings: list[Binding] = []
     truncated = False
@@ -359,9 +363,23 @@ def _linear_query(
             ordered_node_keys, ordered_edge_keys, qnodes, qedges,
             start_id_override=start_id,
         )
+        # The nodes match_path started this iteration from, so a path can be
+        # anchored at its known end regardless of how each edge is oriented.
+        start_set: set[str] | None = None
+        if start_id is not None and start_id in graph.node_to_id:
+            if node_subclassing:
+                start_set = {
+                    graph.nodes[i] for i in graph._expand_subclasses(
+                        graph.node_to_id[start_id], subclass_depth
+                    )
+                }
+            else:
+                start_set = {start_id}
+
         remaining = limit - len(bindings)
         raw_paths, stats = graph.match_path(
             path_spec, limit=remaining, hop_directions=hop_directions,
+            hop_extra_specs=hop_extra_specs,
             node_subclassing=node_subclassing, subclass_depth=subclass_depth,
             return_stats=True,
         )
@@ -373,14 +391,26 @@ def _linear_query(
 
             if path:
                 dirs = hop_directions or [True] * len(path)
-                # A reverse hop stores (neighbour, pred, frontier_node), so the
-                # chain positions are swapped relative to a forward hop.
+                # Walk the chain by shared endpoint rather than by hop
+                # direction.  Direction alone is wrong once a hop can also be
+                # walked the other way for its symmetric predicates: such an
+                # edge comes back in true (subject, predicate, object) order,
+                # which is the *opposite* of what the hop's direction implies,
+                # and reading it by direction swapped the two endpoints — a
+                # query pinned to one gene returned the other one bound in its
+                # place.
                 first_subj, _, first_obj = path[0]
-                nodes[ordered_node_keys[0]] = first_subj if dirs[0] else first_obj
+                if start_set is not None:
+                    cur = first_subj if first_subj in start_set else first_obj
+                else:
+                    # Open start node: nothing to anchor on, so fall back to the
+                    # declared direction.
+                    cur = first_subj if dirs[0] else first_obj
+                nodes[ordered_node_keys[0]] = cur
                 for hop_idx, (subj, _, obj) in enumerate(path):
-                    nodes[ordered_node_keys[hop_idx + 1]] = (
-                        obj if dirs[hop_idx] else subj
-                    )
+                    nxt = obj if subj == cur else subj
+                    nodes[ordered_node_keys[hop_idx + 1]] = nxt
+                    cur = nxt
 
             # Post-filter: check multi-predicate edges.
             skip = False
@@ -983,12 +1013,17 @@ def _matching_predicates(
     actual_preds = graph.edges_between(source, target)
 
     allowed = qedge.get("predicates")
-    has_symmetric = allowed and any(p in SYMMETRIC_PREDICATES for p in allowed)
+    symmetric_allowed = {p for p in (allowed or []) if p in SYMMETRIC_PREDICATES}
 
-    # Also check reverse for symmetric predicates.
-    if has_symmetric:
-        reverse_preds = graph.edges_between(target, source)
-        # Combine, marking reverse preds (they still match for symmetric).
+    # Reverse-direction edges count only for the symmetric predicates.  Taking
+    # every reverse edge whenever *any* allowed predicate was symmetric matched
+    # one-way edges backwards: a query for [treats, interacts_with] returned a
+    # stored ``C treats D`` as though ``D treats C``.
+    if symmetric_allowed:
+        reverse_preds = [
+            p for p in graph.edges_between(target, source)
+            if p in symmetric_allowed
+        ]
         # Sorted for the same reason as the candidate set: callers take
         # ``preds[0]`` as *the* predicate for the edge binding, so iterating a
         # string set here made which predicate got reported vary between runs
