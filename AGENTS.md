@@ -195,12 +195,29 @@ the delivery layer is not).
 ```
 
 `tests/test_corpus.py` additionally runs the
-[HelmsDeep](https://github.com/TranslatorSRI/HelmsDeep) TRAPI corpus against a
-**real** graph. It skips wherever the data is absent (CI included), so enable it
-by pointing at a built graph and putting `trapi_corpus.py` on the path:
+[HelmsDeep](https://github.com/TranslatorSRI/HelmsDeep) TRAPI corpus — 12 query
+types across its retriever, shepherd and pathfinder segments — against a **real**
+graph. It skips wherever the data or the harness is absent (CI included), and a
+skip is easy to mistake for a pass, so check for `5 passed` rather than a clean
+exit.
+
+Fetch the harness once (self-contained: stdlib imports only, no `helmsdeep`
+package needed):
 
 ```bash
-DATA_DIR=~/tmp/csrgraph_data GRAPH_NAME=translator_kg_2026-07-19 PYTHONPATH=~/tmp \
+BASE=https://raw.githubusercontent.com/TranslatorSRI/HelmsDeep/main/helmsdeep
+curl -sL -o ~/tmp/trapi_corpus.py $BASE/trapi_corpus.py
+curl -sL -o ~/tmp/curie_list.json $BASE/curie_list.json   # 991 MONDO long-tail pool
+```
+
+`curie_list.json` must sit **beside** `trapi_corpus.py` — it is read relative to
+the module's own directory. Without it the module still imports but silently
+falls back to a 4-disease pool, so the long-tail queries stop being long-tail.
+
+Then point at a built graph and put both on the path:
+
+```bash
+DATA_DIR=~/tmp/releases/2026-07-19 GRAPH_NAME=translator_kg_2026-07-19 PYTHONPATH=~/tmp \
     .venv/bin/python -m pytest tests/test_corpus.py -q
 ```
 
@@ -223,10 +240,26 @@ exits with an install hint rather than a traceback.
 
 ```bash
 DATA_DIR=~/tmp/releases/2026-07-19 GRAPH_NAME=translator_kg_2026-07-19 \
-    .venv/bin/python mcp_server.py     # stdio transport
+    .venv/bin/python mcp_server.py     # stdio transport (default)
 
 claude mcp add csrgraph -- /abs/path/.venv/bin/python /abs/path/mcp_server.py
 ```
+
+stdio is the default and needs no lifecycle management — the client spawns its own
+copy, so a server started by hand in a terminal is reachable by nobody.
+`--http [--host --port]` serves streamable HTTP instead, which is worth it when
+several sessions run at once: the graph is ~1.4 GB resident, so N stdio clients
+cost N times that while N HTTP clients cost it once. The trade is that `_LOCK` is
+shared too, so a slow query in one session delays the others.
+
+```bash
+.venv/bin/python mcp_server.py --http --port 8791
+claude mcp add --transport http csrgraph http://127.0.0.1:8791/mcp
+```
+
+The port default is 8791, not 8000 — 8000 is `trapi_server.py`'s, and the clash is
+silent until one of them fails to bind. Stateless by default, so independent
+sessions need no affinity; loopback-only, and there is no auth.
 
 Tools: `resolve_entity`, `find_associations`, `connect_entities`, `list_neighbors`,
 `graph_query`, `describe_schema`, `graph_info`. Entity arguments accept a **CURIE
