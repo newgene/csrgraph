@@ -56,6 +56,11 @@ queries you need, in the data dir:
 
 A running Elasticsearch server is required for name lookup and category/text search.
 
+Upstream KGX archives come from **<https://kgx-storage.ci.transltr.io/releases/>** —
+see [`docs/kgx-data-releases.md`](docs/kgx-data-releases.md) for the layout, how to find
+the current release, the download-and-build recipe, and the two ES build traps that
+surface as empty results rather than errors.
+
 ## Defaults
 
 `kg_query.get_graph()` and the TRAPI server share these defaults (all overridable):
