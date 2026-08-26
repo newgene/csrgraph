@@ -57,7 +57,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Iterable, Any
+from typing import Any, Iterable, NamedTuple
 
 from csrgraph_kgx import CSRGraph, _strip_biolink
 
@@ -287,6 +287,60 @@ def query(
     dict
         A TRAPI ``Message`` dict with ``query_graph``, ``knowledge_graph``,
         and ``results``.
+
+    See Also
+    --------
+    match : the same matching, stopping before the TRAPI Message is assembled.
+    """
+    result = match(
+        graph, query_graph, limit=limit, expander=expander,
+        node_subclassing=node_subclassing, subclass_depth=subclass_depth,
+    )
+    return _build_message(
+        graph, result.query_graph, result.bindings, result.query_ids,
+        truncated=result.truncated, limit=limit,
+    )
+
+
+class MatchResult(NamedTuple):
+    """Matching output, before any TRAPI response shape is imposed.
+
+    ``query_graph`` is the *effective* graph -- post-expansion when an
+    ``expander`` widened predicates and qualifiers -- because that, not the
+    caller's original, is what the bindings were produced against and what a
+    TRAPI Message must echo back.
+    """
+    bindings: list[Binding]
+    query_ids: dict[str, dict[str, str]] | None
+    truncated: bool
+    query_graph: dict
+
+
+def match(
+    graph: CSRGraph,
+    query_graph: dict,
+    *,
+    limit: int = 1000,
+    expander: BiolinkExpander | None = None,
+    node_subclassing: bool = True,
+    subclass_depth: int | None = 1,
+) -> MatchResult:
+    """Match a TRAPI QueryGraph and return raw bindings.
+
+    Everything :func:`query` does except assembling the Message: the same
+    linear/general dispatch, the same post-filter pipeline, the same semantics.
+    Arguments carry the meanings documented on :func:`query`.
+
+    This exists so that callers wanting compact output do not pay for verbose
+    output first.  ``_build_message`` inflates every bound node and edge into
+    knowledge-graph entries with full metadata, which for an agentic client is
+    work done solely to be discarded -- and the metadata lookups are the
+    expensive part.  Bindings are just node/edge key maps, so a caller can
+    project the columns it wants and nothing more.
+
+    Prefer this over reaching for the private helpers: the dispatch below is not
+    a detail (the linear fast path is ~80x faster than the general matcher on
+    the same shape), and the four post-filters must run in this order.
     """
     qnodes, qedges = _validate_query_graph(query_graph)
     if expander is not None:
@@ -320,9 +374,7 @@ def query(
     bindings = _apply_edge_attribute_constraints(graph, bindings, qedges)
     bindings = _apply_qualifier_filters(graph, bindings, qedges)
 
-    return _build_message(
-        graph, query_graph, bindings, query_ids, truncated=truncated, limit=limit
-    )
+    return MatchResult(bindings, query_ids, truncated, query_graph)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

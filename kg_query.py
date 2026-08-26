@@ -38,7 +38,11 @@ from pathlib import Path
 from typing import Iterable, List, Literal, Optional, Sequence, Tuple, overload
 
 from csrgraph_kgx import CSRGraph, MatchStats
-from metadata_db import ElasticsearchMetadataBackend, LMDBMetadataBackend
+from metadata_db import (
+    ElasticsearchMetadataBackend,
+    HybridMetadataBackend,
+    LMDBMetadataBackend,
+)
 
 # --------------------------------------------------------------------------- #
 # Defaults (env-overridable, matching trapi_server.py conventions)
@@ -83,7 +87,21 @@ def get_graph(
         Note ``resolve``/``resolve_one`` need Elasticsearch: name and symbol
         lookup is a full-text query with no LMDB equivalent. Pass
         ``backend="es"`` for those.
+
+        ``"hybrid"`` needs both stores and is the one option that does not force
+        that trade-off: point lookups go to LMDB (400x faster -- 0.004 ms vs
+        1.6 ms) while full-text and large filtered scans go to Elasticsearch.
+        It is what a long-lived server wants, since a single graph then answers
+        both ``resolve`` and ``get_node`` well. Unlike ``auto`` it never silently
+        degrades: both backends are required, so a missing one raises here rather
+        than surfacing as empty results later.
     """
+    # Validate the argument before touching the filesystem, so a typo'd backend
+    # is not masked by a "snapshot not found" error from an unrelated path.
+    if backend not in {"auto", "es", "lmdb", "hybrid"}:
+        raise ValueError(
+            f"backend must be 'auto', 'es', 'lmdb' or 'hybrid', not {backend!r}"
+        )
     data_dir = Path(data_dir).expanduser()
     snapshot = data_dir / f"{name}.csrgraph.pkl.zst"
     if not snapshot.exists():
@@ -93,8 +111,13 @@ def get_graph(
             + ", ".join(sorted(p.name.split('.')[0] for p in data_dir.glob('*.csrgraph.pkl.zst')))
         )
     lmdb_path = data_dir / f"{name}.metadata.lmdb"
-    if backend not in {"auto", "es", "lmdb"}:
-        raise ValueError(f"backend must be 'auto', 'es' or 'lmdb', not {backend!r}")
+    if backend == "hybrid":
+        if not lmdb_path.exists():
+            raise FileNotFoundError(f"LMDB store not found: {lmdb_path}")
+        return CSRGraph.load(str(snapshot), db=HybridMetadataBackend(
+            LMDBMetadataBackend(str(lmdb_path), readonly=True),
+            ElasticsearchMetadataBackend(es_host, index_prefix=name),
+        ))
     use_lmdb = backend == "lmdb" or (backend == "auto" and lmdb_path.exists())
     if use_lmdb:
         if not lmdb_path.exists():
@@ -109,6 +132,45 @@ def get_graph(
 # --------------------------------------------------------------------------- #
 # Name <-> CURIE resolution (via Elasticsearch)
 # --------------------------------------------------------------------------- #
+def _es_backend(db: object) -> ElasticsearchMetadataBackend:
+    """Return the Elasticsearch backend behind *db*, unwrapping a hybrid.
+
+    Full-text resolution needs the raw Elasticsearch client and the real index
+    name, and the two attributes collide: ``ElasticsearchMetadataBackend._es``
+    is the client, while ``HybridMetadataBackend._es`` is an
+    *ElasticsearchMetadataBackend*. Reading ``db._es`` blindly therefore yields
+    a backend where a client is expected -- and the index name silently falls
+    back to the module default, which is the wrong index whenever the graph is
+    not ``DEFAULT_GRAPH``. Unwrap explicitly instead.
+    """
+    inner = getattr(db, "_es", None)
+    if isinstance(inner, ElasticsearchMetadataBackend):
+        db = inner                     # hybrid: step down to the ES backend
+    if not isinstance(db, ElasticsearchMetadataBackend):
+        raise RuntimeError(
+            "resolve() needs Elasticsearch: name/symbol lookup is a full-text "
+            "query with no LMDB equivalent. Load the graph with "
+            "backend='es' or backend='hybrid'."
+        )
+    return db
+
+
+def _has_lmdb(db: object) -> bool:
+    """Whether *db* can serve point lookups from LMDB (directly or via hybrid)."""
+    if isinstance(db, LMDBMetadataBackend):
+        return True
+    return isinstance(getattr(db, "_lmdb", None), LMDBMetadataBackend)
+
+
+def _es_backend_available(db: object) -> bool:
+    """Whether *db* can serve full-text resolution."""
+    try:
+        _es_backend(db)
+    except RuntimeError:
+        return False
+    return True
+
+
 def resolve(
     text: str,
     *,
@@ -125,11 +187,9 @@ def resolve(
     across entity types.
     """
     graph = graph or get_graph()
-    es = graph.db._es  # ElasticsearchMetadataBackend
-    index = f"{graph.db._nodes_idx}" if hasattr(graph.db, "_nodes_idx") else None
-    if index is None:
-        # Fall back to convention used by ElasticsearchMetadataBackend.
-        index = f"{DEFAULT_GRAPH}_nodes"
+    es_backend = _es_backend(graph.db)
+    es = es_backend._es          # the raw Elasticsearch client
+    index = es_backend._nodes_idx
 
     should = [
         {"term": {"name.keyword": {"value": text, "boost": 10}}},  # exact (if mapped)
@@ -177,9 +237,18 @@ def names(graph: CSRGraph, curies: Sequence[str]) -> dict[str, str]:
     curies = list(dict.fromkeys(curies))
     if not curies:
         return {}
-    es = graph.db._es
-    index = getattr(graph.db, "_nodes_idx", f"{DEFAULT_GRAPH}_nodes")
-    resp = es.mget(index=index, ids=curies, _source=["name"])
+    db = graph.db
+    # Prefer LMDB point lookups: ~400x faster than ES per id (0.004 ms vs
+    # 1.6 ms), and -- the reason this branch exists rather than just being an
+    # optimisation -- they work with no ES index at all. A release directory
+    # ships an LMDB store only, so the _mget path below would make
+    # format_path() unusable exactly where the graph is most likely deployed.
+    if _has_lmdb(db):
+        return {c: (db.get_node(c) or {}).get("name") or c for c in curies}
+    es_backend = _es_backend(db)
+    resp = es_backend._es.mget(
+        index=es_backend._nodes_idx, ids=curies, _source=["name"],
+    )
     out: dict[str, str] = {}
     for doc in resp["docs"]:
         cid = doc["_id"]
