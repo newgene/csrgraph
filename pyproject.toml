@@ -36,13 +36,17 @@ dependencies = [
 #     free-threading support (jnwatson/py-lmdb#458), so on a free-threaded
 #     interpreter importing it re-enables the GIL. Pin so that behaviour does not
 #     change under you between installs.
+#   mcp — 2.x renamed FastMCP to MCPServer and changed other APIs, so mcp_server.py
+#     will not import on 1.x. Capped below 3 for the same reason.
 lmdb = ["lmdb>=1.4,<3"]
 es = ["elasticsearch>=8,<10"]
 duckdb = ["duckdb>=0.10"]
 server = ["fastapi>=0.100", "uvicorn>=0.20"]
+mcp = ["mcp>=2,<3"]
 psutil = ["psutil>=5.9"]
 all = [
     "lmdb>=1.4,<3",
+    "mcp>=2,<3",
     "elasticsearch>=8,<10",
     "duckdb>=0.10",
     "fastapi>=0.100",
@@ -56,7 +60,7 @@ Homepage = "https://github.com/newgene/csrgraph"
 Repository = "https://github.com/newgene/csrgraph"
 
 [tool.setuptools]
-py-modules = ["csrgraph_kgx", "metadata_db", "trapi", "trapi_server", "bench_backends"]
+py-modules = ["csrgraph_kgx", "metadata_db", "trapi", "trapi_server", "mcp_server", "kg_pattern", "bench_backends"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

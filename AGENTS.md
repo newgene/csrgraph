@@ -172,11 +172,13 @@ DATA_DIR=~/tmp/releases/2026-08-14 GRAPH_NAME=dgidb NO_ES=1 \
     .venv/bin/python trapi_server.py
 ```
 
-`kg_query.get_graph()` takes `backend="auto"|"lmdb"|"es"` and defaults to `auto`,
-preferring the LMDB store when the directory has one. `resolve`/`resolve_one`
-still need `backend="es"` — full-text lookup has no LMDB equivalent. Serving
-opens LMDB read-only, so a release directory is never mutated and read-only
-mounts work.
+`kg_query.get_graph()` takes `backend="auto"|"lmdb"|"es"|"hybrid"` and defaults to
+`auto`, preferring the LMDB store when the directory has one. `resolve`/`resolve_one`
+need `backend="es"` or `"hybrid"` — full-text lookup has no LMDB equivalent.
+`"hybrid"` requires both stores and is what a long-lived server wants: point
+lookups go to LMDB (400× faster — 0.004 ms vs 1.6 ms), full-text and large
+filtered scans go to ES. Serving opens LMDB read-only, so a release directory is
+never mutated and read-only mounts work.
 
 Plan and remaining work: `docs/production-release-plan.md` (F1–F6 implemented;
 the delivery layer is not).
@@ -207,3 +209,80 @@ into a tripwire for data changes rather than code changes.
 ```bash
 .venv/bin/python trapi_server.py       # defaults: translator_kg_2026-07-19, ES on :9200, port 8000
 ```
+
+## MCP server (optional)
+
+`mcp_server.py` exposes the graph to agentic clients. It needs the optional `mcp`
+extra (`pip install -e ".[mcp]"`, pulled in by `[all]`); without it the module
+exits with an install hint rather than a traceback.
+
+```bash
+DATA_DIR=~/tmp/releases/2026-07-19 GRAPH_NAME=translator_kg_2026-07-19 \
+    .venv/bin/python mcp_server.py     # stdio transport
+
+claude mcp add csrgraph -- /abs/path/.venv/bin/python /abs/path/mcp_server.py
+```
+
+Tools: `resolve_entity`, `find_associations`, `connect_entities`, `list_neighbors`,
+`graph_query`, `describe_schema`, `graph_info`. Entity arguments accept a **CURIE
+or a free-text name** (resolved via `resolve_one`), and paths come back as compact
+`Name (CURIE) --[pred]--> Name` strings, because an agent pays tokens for every
+result. Result caps are deliberately small (`MAX_HOPS_CEILING`, `LIMIT_CEILING`)
+and a clamped result sets `truncated: true` so a subset is never read as
+exhaustive.
+
+### `graph_query` — full TRAPI expressiveness, no TRAPI format
+
+`kg_pattern.py` translates a compact triple pattern into a TRAPI QueryGraph and
+runs it through `trapi.match`, so branching, cycles, predicate unions and
+qualifier constraints are all reachable without authoring TRAPI JSON:
+
+```python
+[["CDK2", "affects", "?d:Disease"], ["?drug", "treats", "?d"]]   # a branch
+```
+
+**A repeated `?variable` is one node** — that is what makes branching
+expressible, and `tests/test_kg_pattern.py` pins it, because allocating two nodes
+by mistake still returns plausible, wrong answers. Node terms: CURIE, free-text
+name, `?var`, `?var:Category`, `biolink:Category`, `*`. Edge terms: `null`,
+`"affects"`, `["affects","treats"]`, or
+`{"predicate": …, "object_direction_qualifier": "increased"}` (short qualifier
+names are aliased from `trapi._QUALIFIER_TYPE_TO_FIELD`, so the two cannot
+drift).
+
+Results project to `columns`/`rows` of the requested variables only — never a
+knowledge graph. `trapi.match()` exists for exactly this: `trapi.query()` is now
+`_build_message(match(...))`, and `_build_message` is what inflates every bound
+node into KG entries with full metadata. Skipping it is the difference between
+compact and verbose, and the metadata lookups are the expensive part.
+
+Two guards worth keeping:
+
+- **`require_pinned`** rejects an all-variable pattern, which would give the
+  matcher no anchor and degenerate into scanning the graph. It runs *after*
+  translation, so a malformed pattern reports its real error and a name-pinned
+  node still counts.
+- **`expand_predicates`** derives the expander's terms from the query.
+  `BiolinkExpander.from_bmt()` resolves *only the terms passed to it*, so calling
+  it with no arguments builds an expander that silently expands nothing.
+
+`describe_schema` lists the graph's actual 63 predicates (most frequent first)
+and its categories, so a model authors patterns from the real vocabulary instead
+of guessing. Categories need an ES terms aggregation and come back `null` on
+LMDB-only, rather than being guessed from the Biolink model.
+
+Two behaviours are load-bearing, not incidental:
+
+- **Calls are serialised** behind one lock. LMDB reads under concurrent threads
+  collapse to ×0.03 of single-thread throughput — *less* aggregate work than one
+  thread — from GIL convoying over cursor steps
+  (`docs/concurrency-and-scalability-2026-07-19.md`). liblmdb and py-lmdb are both
+  thread-safe; the GIL is the problem. MCP clients issue parallel tool calls
+  freely, so removing the lock makes bursts slower, not faster.
+- **ES is optional.** Startup prefers `backend="hybrid"` and falls back to
+  LMDB-only if ES is unreachable, so a release directory works out of the box.
+  Only `resolve_entity` then fails, with a message telling the caller to pass
+  CURIEs; `graph_info().resolve_available` reports which mode is live.
+
+Requires ES for `resolve_entity` only, so the local index must be built for the
+*same* graph name (`<graph>_nodes`), not just any graph.
