@@ -245,3 +245,42 @@ class TestMatchMatchesQuery:
         assert set(result.query_graph["edges"]["e0"]["predicates"]) == {
             "biolink:affects", "biolink:affects_sensitivity_to",
         }
+
+
+class TestBiolinkVersionPinning:
+    """A bare version must become a schema URL.
+
+    Passing it straight to ``bmt.Toolkit(schema=...)`` made it look for a local
+    *file* named "4.4.2" — so pinning to the graph's version, the one thing this
+    parameter exists for, failed with FileNotFoundError while unpinned expansion
+    kept working. The failure only appears when someone actually pins.
+    """
+
+    @pytest.mark.parametrize("version", ["4.4.2", "v4.4.2"])
+    def test_bare_version_becomes_the_tagged_model_url(self, version):
+        assert trapi._biolink_schema(version) == (
+            "https://raw.githubusercontent.com/biolink/biolink-model/"
+            "v4.4.2/biolink-model.yaml"
+        )
+
+    def test_single_component_version_is_still_a_version(self):
+        assert trapi._biolink_schema("5").endswith("/v5/biolink-model.yaml")
+
+    @pytest.mark.parametrize("schema", [
+        "https://example.org/custom-model.yaml",
+        "/local/path/biolink-model.yaml",
+        "biolink-model.yaml",
+    ])
+    def test_urls_and_paths_pass_through(self, schema):
+        """Pinning to a fork or a local checkout must keep working."""
+        assert trapi._biolink_schema(schema) == schema
+
+    def test_none_means_toolkit_default(self):
+        assert trapi._biolink_schema(None) is None
+        assert trapi._biolink_schema("") is None
+
+    def test_expander_cache_keys_on_the_version(self):
+        """Two versions must not share one cached expander."""
+        kp._expander_for.cache_clear()
+        info = kp._expander_for.cache_info()
+        assert info.currsize == 0

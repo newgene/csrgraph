@@ -217,11 +217,23 @@ def _open_tar_archive(archive: Path, suffix: str) -> tarfile.TarFile:
     raise ValueError(f"Unsupported archive format: {suffix}")
 
 
-def _stream_kgx(archive_path: str):
-    """Yield ``('node', raw_dict)`` and ``('edge', raw_dict)`` from a KGX archive.
+def _stream_kgx(archive_path: str, *, include_metadata: bool = False):
+    """Yield ``('node', raw)`` and ``('edge', raw)`` from a KGX archive.
 
     Streams line-by-line; the full JSONL is never held in memory at once.
     Records missing required IDs are skipped.
+
+    With *include_metadata*, also yields one ``('graph_metadata', raw)`` for the
+    archive's ``graph-metadata.json``, which carries ``biolinkVersion`` among
+    other provenance. Surfaced here rather than read separately because it is the
+    *last* member of the tar, so a dedicated read would decompress the whole
+    archive again (25 GB uncompressed on the Translator KG) to reach it.
+
+    **Opt-in, deliberately.** Not every consumer dispatches on equality: the
+    SQLite builder is ``if kind == "node": ... else:``, so an unrecognised kind
+    lands in its edge branch and dies on ``KeyError: 'subject'``. Defaulting to
+    off keeps a new kind from being a breaking change to callers that never asked
+    for it.
     """
     archive = Path(archive_path)
     suffix  = "".join(archive.suffixes)
@@ -247,6 +259,11 @@ def _stream_kgx(archive_path: str):
                     rec = json.loads(line)
                     if rec.get("subject") and rec.get("predicate") and rec.get("object"):
                         yield "edge", rec
+            elif include_metadata and basename == "graph-metadata.json":
+                try:
+                    yield "graph_metadata", json.load(fobj)
+                except ValueError:
+                    pass          # provenance is optional; never fail a build on it
 
 
 # ===========================================================================

@@ -99,7 +99,9 @@ def _query_terms(query_graph: dict) -> tuple[tuple[str, ...], tuple[str, ...]]:
 
 @lru_cache(maxsize=32)
 def _expander_for(
-    predicates: tuple[str, ...], qualifier_values: tuple[str, ...]
+    predicates: tuple[str, ...],
+    qualifier_values: tuple[str, ...],
+    biolink_version: str | None = None,
 ) -> Any:
     """A BiolinkExpander covering exactly these terms.
 
@@ -109,11 +111,20 @@ def _expander_for(
     Deriving the terms from the query is therefore not an optimisation but the
     difference between expansion working and quietly doing nothing.
 
+    ``biolink_version`` should be the version the *graph* was normalised against
+    -- ``manifest.json`` records it as ``biolink_version``, taken from the KGX
+    archive's ``biolinkVersion``. Left unset, the toolkit resolves against
+    whatever it fetches by default, which drifts as Biolink releases: the
+    2026-07-19 Translator KG is 4.4.2 while the default fetched 4.4.4. Expanding
+    a predicate through a different model than the data was built with produces
+    wrong answers quietly rather than an error, so pin it.
+
     Cached because constructing the toolkit parses the Biolink model (~1 s).
     """
     return trapi.BiolinkExpander.from_bmt(
         predicates=predicates or None,
         qualifier_values=qualifier_values or None,
+        biolink_version=biolink_version,
     )
 
 
@@ -267,6 +278,7 @@ def run(
     resolver: Callable[[str], str] | None = None,
     expand_predicates: bool = False,
     expander: Any | None = None,
+    biolink_version: str | None = None,
     node_subclassing: bool = True,
     name_lookup: Callable[[Sequence[str]], dict[str, str]] | None = None,
     require_pinned: bool = True,
@@ -295,7 +307,7 @@ def run(
             "whole graph"
         )
     if expander is None and expand_predicates:
-        expander = _expander_for(*_query_terms(query_graph))
+        expander = _expander_for(*_query_terms(query_graph), biolink_version)
     result = trapi.match(
         graph, query_graph, limit=enumerate_limit, expander=expander,
         node_subclassing=node_subclassing,

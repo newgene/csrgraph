@@ -153,6 +153,27 @@ nothing currently measured gets faster. The case rests on branching and cyclic
 shapes being legitimate TRAPI that some caller will eventually send — not on a
 benchmark that improves today.
 
+> **Update (2026-08-26): the caller arrived.** `mcp_server.py`'s `graph_query`
+> tool routes every branching and cyclic pattern here through `kg_pattern` →
+> `trapi.match`, and shared `?variable` patterns are the feature it exists to
+> provide. Two premises above have shifted:
+>
+> - "Nothing currently measured gets faster" is no longer true in practice. A
+>   two-triple branch (`[["CDK2","affects","?d:Disease"],["?drug","treats","?d"]]`,
+>   157 matched paths) takes ~1.0 s against the 2026-07-19 release, and by the
+>   profile above most of that is `_reverse_neighbors`. Phase 1's fifteen lines
+>   are the obvious first move.
+> - The 535 MB for the transposed plan is no longer hypothetical: the MCP server
+>   is a long-lived process that answers *both* branching and reverse linear
+>   queries, so the marginal cost really is near zero there — the "server that
+>   does not" case now needs naming rather than assuming.
+>
+> Verification step 5 still holds and is now more useful, not less: the corpus
+> exercises 12 query types and none route here, so it should stay bit-identical
+> while `graph_query` results change. `tests/test_kg_pattern.py` covers the
+> translation; the shared-variable identity test is the one that would catch a
+> routing mistake.
+
 ## Verification
 
 1. **Answer sets identical, uncapped.** Run the branching and cyclic queries above

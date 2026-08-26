@@ -161,6 +161,29 @@ def _fmt_paths(paths, limit: int) -> list[str]:
     return [kq.format_path(_g(), p) for p in paths[:limit]]
 
 
+@lru_cache(maxsize=1)
+def _manifest() -> dict:
+    """The release manifest for DATA_DIR, or {} for a hand-built directory."""
+    path = DATA_DIR / "manifest.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except ValueError:
+        return {}
+
+
+def _biolink_version() -> str | None:
+    """Biolink version to expand predicates against.
+
+    Taken from the release manifest, so expansion uses the same model the data
+    was normalised with. BIOLINK_VERSION overrides it; None means "whatever the
+    toolkit fetches", which drifts as Biolink releases and silently produces
+    answers from a different model than the graph was built with.
+    """
+    return os.environ.get("BIOLINK_VERSION") or _manifest().get("biolink_version")
+
+
 def _resolver():
     """A name->CURIE callable for patterns, or None when ES is absent.
 
@@ -313,6 +336,7 @@ def graph_query(
                 limit=limit,
                 resolver=_resolver(),
                 expand_predicates=expand_predicates,
+                biolink_version=_biolink_version(),
                 name_lookup=lambda curies: kq.names(_g(), curies),
             )
         except kp.PatternError as exc:
@@ -348,8 +372,7 @@ def describe_schema(top_categories: int = 40) -> dict:
                 "are available. Call this first if a query fails unexpectedly."
 )
 def graph_info() -> dict:
-    manifest_path = DATA_DIR / "manifest.json"
-    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else None
+    manifest = _manifest()
     return {
         "graph_name": GRAPH_NAME,
         "data_dir": str(DATA_DIR),
@@ -359,7 +382,8 @@ def graph_info() -> dict:
         "backend": type(_g().db).__name__,
         # False means resolve_entity is unavailable and callers must pass CURIEs.
         "resolve_available": kq._es_backend_available(_g().db),
-        "release": None if manifest is None else {
+        "biolink_version": _biolink_version(),
+        "release": None if not manifest else {
             "version": manifest.get("version"),
             "store_format_version": manifest.get("store_format_version"),
         },

@@ -162,6 +162,13 @@ Before publishing it recounts the archive and refuses to publish if the stores d
 not match (`--no-gate-completeness` to skip the extra pass; `--gate-corpus` to
 also run `tests/test_corpus.py` against the candidate).
 
+`manifest.json` also carries `biolink_version`, copied from the archive's
+`graph-metadata.json`. Predicate expansion is pinned to it, so expansion uses the
+same model the data was normalised with — see
+[`docs/kgx-data-releases.md`](docs/kgx-data-releases.md) for why that must be
+re-checked whenever the source release moves. `--no-gate-completeness` leaves it
+`null`, since that flag skips the pass that reads it.
+
 `manifest.json` carries `store_format_version`, which is **not cosmetic**: edge
 metadata is keyed `(subject, predicate, object, qualifier_fingerprint)`, and a
 store built before that key is *silently* unreadable by current code — prefix

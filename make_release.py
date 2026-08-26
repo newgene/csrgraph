@@ -170,7 +170,7 @@ def _build_lmdb(archive: Path, dest: Path, node_fields: list[str],
     return variants
 
 
-def _gate_completeness(archive: Path, distinct: int, variants: int) -> None:
+def _gate_completeness(archive: Path, distinct: int, variants: int) -> dict:
     """F5: count the source independently and require the stores to match it.
 
     The bound in :func:`_verify` is a sanity check between two numbers the build
@@ -188,7 +188,13 @@ def _gate_completeness(archive: Path, distinct: int, variants: int) -> None:
     t0 = time.perf_counter()
     tri: set[int] = set()
     var: set[int] = set()
-    for kind, rec in _stream_kgx(str(archive)):
+    graph_meta: dict = {}
+    for kind, rec in _stream_kgx(str(archive), include_metadata=True):
+        if kind == "graph_metadata":
+            # Free here: this pass already decompresses the whole archive, and
+            # graph-metadata.json is its last member.
+            graph_meta = rec
+            continue
         if kind != "edge":
             continue
         spo = f"{rec['subject']}|{rec['predicate']}|{rec['object']}"
@@ -211,6 +217,7 @@ def _gate_completeness(archive: Path, distinct: int, variants: int) -> None:
                "with a key that ignores qualifiers." if variants < len(var)
                else "The store has more records than the source, which cannot happen.")
         )
+    return graph_meta
 
 
 def _gate_corpus(release_dir: Path, graph_name: str) -> None:
@@ -295,7 +302,8 @@ def _verify(lmdb_dir: Path, graph_path: Path, distinct: int, records: int,
 
 def _manifest(*, graph_name: str, version: str, archive: Path,
               graph_path: Path, lmdb_dir: Path, memmap_dir: Path | None,
-              nodes: int, distinct: int, records: int, variants: int) -> dict:
+              nodes: int, distinct: int, records: int, variants: int,
+              graph_meta: dict | None = None) -> dict:
     """Assemble the F2 manifest, hashing every artifact in the staging dir."""
     print("      hashing artifacts ...", flush=True)
     pkl_hash, pkl_bytes = _sha256_file(graph_path)
@@ -317,6 +325,12 @@ def _manifest(*, graph_name: str, version: str, archive: Path,
         "source_sha256": src_hash,
         "source_bytes": src_bytes,
         "store_format_version": STORE_FORMAT_VERSION,
+        # The Biolink version the source was normalised against. Recorded so
+        # predicate expansion can be pinned to it: BiolinkExpander resolving
+        # against a different model than the data was built with is a silent
+        # correctness gap, not an error. None when --no-gate-completeness skipped
+        # the pass that reads it.
+        "biolink_version": (graph_meta or {}).get("biolinkVersion"),
         "artifacts": artifacts,
         "node_count": nodes,
         "edge_count": distinct,            # distinct (subject, predicate, object)
@@ -381,8 +395,9 @@ def main() -> None:
                                fields(a.edge_metadata_fields))
         if not a.skip_verify:
             _verify(lmdb_dir, graph_path, distinct, records, variants)
+        graph_meta: dict = {}
         if not a.no_gate_completeness:
-            _gate_completeness(archive, distinct, variants)
+            graph_meta = _gate_completeness(archive, distinct, variants)
         if a.gate_corpus:
             _gate_corpus(stage, a.graph_name)
 
@@ -391,6 +406,7 @@ def main() -> None:
             graph_path=graph_path, lmdb_dir=lmdb_dir,
             memmap_dir=None if a.no_memmap else CSRGraph._memmap_dir(str(graph_path)),
             nodes=nodes, distinct=distinct, records=records, variants=variants,
+            graph_meta=graph_meta,
         )
         # Last file written, so the atomic move below publishes a complete release.
         (stage / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

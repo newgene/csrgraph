@@ -123,13 +123,48 @@ All rebuilt from the 2026-07-19 upstream release. Earlier local builds
 (`translator_kg` Jun 5, `translator_kg_2026_04`, `processed_tier0_kg`) were
 format-1 and have been deleted.
 
-## One version to watch
+## Keep the Biolink version in sync with the source release
 
-The 2026-07-19 `translator_kg` reports `biolink_version: 4.4.2`, but
-`BiolinkExpander.from_bmt()` with no `biolink_version` resolves against whatever
-the toolkit fetches by default — observed as **4.4.4**. Predicate expansion then
-uses a slightly different model than the data was normalised with. Pin it to the
-graph's version when that matters:
+**Every source release pins its own Biolink version, and predicate expansion has
+to match it.** The KGX archive records it in `graph-metadata.json` as
+`biolinkVersion` (2026-07-19 `translator_kg`: **4.4.2**). Left unpinned,
+`BiolinkExpander.from_bmt()` resolves against whatever the toolkit fetches by
+default — observed as **4.4.4** — so `treats` expands through a *different* model
+than the data was normalised with. That produces wrong answers quietly; there is
+no error, just a predicate set that does not match the graph.
+
+This is wired up so it normally takes care of itself:
+
+1. `make_release.py` copies `biolinkVersion` into `manifest.json` as
+   `biolink_version`, read during the completeness gate at no extra I/O cost.
+   **`--no-gate-completeness` leaves it `null`** — that flag skips the pass that
+   reads it.
+2. `mcp_server.py` passes the manifest value into `kg_pattern.run(...)`, so
+   `graph_query(expand_predicates=True)` expands against the graph's own version.
+   `graph_info()` reports it, and `BIOLINK_VERSION` overrides it.
+3. `kg_pattern._expander_for()` caches per version, so two versions never share
+   one expander.
+
+**So: when you take a new source release, check the version moved.**
+
+```bash
+# what the new release declares
+curl -s https://kgx-storage.ci.transltr.io/releases/latest-release-summary.json \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['translator_kg']['biolink_version'])"
+
+# what the deployed release recorded
+python3 -c "import json; print(json.load(open('$HOME/tmp/releases/<version>/manifest.json')).get('biolink_version'))"
+```
+
+If they differ, rebuild the release rather than pinning by hand — the manifest is
+meant to describe its own data. Releases built before `biolink_version` existed
+report `null`; use `BIOLINK_VERSION=4.4.2` until they are rebuilt.
+
+Note the version is a *version*, not a schema location:
+`trapi._biolink_schema()` maps `4.4.2` → the tagged
+`biolink-model/v4.4.2/biolink-model.yaml` URL, because `bmt.Toolkit(schema=...)`
+wants a URL or path and a bare version made it look for a local file called
+`4.4.2`. URLs and paths still pass through, so a fork or local checkout works:
 
 ```python
 trapi.BiolinkExpander.from_bmt(predicates=[...], biolink_version="4.4.2")

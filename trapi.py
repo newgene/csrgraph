@@ -512,6 +512,34 @@ def _linear_query(
     return bindings, truncated
 
 
+#: Canonical location of a tagged Biolink model, for resolving a bare version.
+_BIOLINK_MODEL_URL = (
+    "https://raw.githubusercontent.com/biolink/biolink-model/v{v}/biolink-model.yaml"
+)
+
+#: A bare semantic version, e.g. "4.4.2" or "v4.4.2".
+_BIOLINK_VERSION_RE = re.compile(r"^v?\d+(?:\.\d+)*$")
+
+
+def _biolink_schema(biolink_version: str | None) -> str | None:
+    """Turn a Biolink *version* into something ``bmt.Toolkit`` accepts.
+
+    ``Toolkit(schema=...)`` wants a URL or a file path, not a version, so passing
+    "4.4.2" straight through made it look for a *local file* named 4.4.2 and fail
+    with FileNotFoundError. A version is what callers actually have -- the KGX
+    archive records ``biolinkVersion`` and the release manifest copies it -- so
+    map it to the tagged model URL here rather than making every caller do it.
+
+    URLs and paths pass through untouched, so pinning to a local or forked model
+    still works.
+    """
+    if not biolink_version:
+        return None
+    if _BIOLINK_VERSION_RE.match(biolink_version):
+        return _BIOLINK_MODEL_URL.format(v=biolink_version.lstrip("v"))
+    return biolink_version
+
+
 class BiolinkExpander:
     """Widens queried predicates and qualifier values to their Biolink descendants.
 
@@ -572,7 +600,8 @@ class BiolinkExpander:
                 "pip install bmt"
             ) from None
 
-        tk = Toolkit(schema=biolink_version) if biolink_version else Toolkit()
+        schema = _biolink_schema(biolink_version)
+        tk = Toolkit(schema=schema) if schema else Toolkit()
 
         pred_map: dict[str, frozenset[str]] = {}
         for p in predicates or ():
