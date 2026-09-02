@@ -84,7 +84,23 @@ NO_ES = env_flag("NO_ES")
 #: max_hops=5 on this graph is not going to like the answer, and neither is its
 #: context window.
 MAX_HOPS_CEILING = 3
-LIMIT_CEILING = 200
+
+#: Cap on rows/paths *returned*. Unlike `kg_pattern.DEFAULT_ENUMERATE_LIMIT`,
+#: which bounds correctness, this one only bounds cost: measured on the
+#: 2026-07-19 graph, 200 rows is ~1,700 tokens for one column and ~2,300 for
+#: two, so 500 is ~4,300-5,700 and 2000 would be ~23,000 -- most of a small
+#: context window spent on one tool result.
+#:
+#: Raised 200 -> 500 because callers chasing complete answers were hitting it
+#: routinely while the honest ceiling for an *agent* is still well under the
+#: full answer set (the qualified-affects pattern has 843). `truncated` marks
+#: the difference either way, which is what keeps a capped result from reading
+#: as exhaustive.
+#:
+#: Override with ``CSRGRAPH_LIMIT_CEILING``. A test suite comparing against
+#: complete answer sets should raise it; it is a policy knob, not a correctness
+#: one, and the two consumers genuinely disagree about the right value.
+LIMIT_CEILING = int(env_var("LIMIT_CEILING", "500"))
 
 # Serialises graph access -- see the module docstring on the LMDB/GIL collapse.
 _LOCK = threading.Lock()

@@ -50,6 +50,7 @@ from functools import lru_cache
 from typing import Any, Callable, Iterable, Sequence
 
 from csrgraph_kgx import CSRGraph
+from metadata_db import env_var
 
 import trapi
 
@@ -61,6 +62,34 @@ _CATEGORY_PREFIX = "biolink:"
 _QUALIFIER_ALIASES: dict[str, str] = {
     field: type_id for type_id, field in trapi._QUALIFIER_TYPE_TO_FIELD.items()
 }
+
+
+#: Paths the matcher may enumerate before constraints are applied. **Not** a cap
+#: on answers returned -- qualifier and attribute constraints are applied *after*
+#: enumeration stops, so this bounds the pool the answers are filtered out of.
+#:
+#: Raised from 1000 to 5000 after measuring where answer counts actually plateau
+#: on the 2026-07-19 graph. 1000 was losing most of the answers on exactly the
+#: shapes ``graph_query`` exists to serve:
+#:
+#: ====================================  ======  ======  =======  ========
+#: pattern                               @1000   @2000   @5000    latency
+#: ====================================  ======  ======  =======  ========
+#: chemical -affects(qualified)-> gene      357     739      843     0.7 s
+#: hub node -*-> anything (rows)            964    1857     1895   < 0.1 s
+#: chemical -treats-> disease (plateaus)     64      64       64   < 0.1 s
+#: branching, hub + wildcards (worst)      1000    2000     5000     1.1 s
+#: ====================================  ======  ======  =======  ========
+#:
+#: So the qualifier case was returning 42% of its answers and a hub case 51%,
+#: silently -- ``truncated`` said so, but nothing said how much was missing. The
+#: cost is worst-case latency on an unselective branching pattern, which is the
+#: one shape that keeps consuming the whole budget: 0.16 s -> 1.12 s. Everything
+#: that plateaus below the cap is unaffected.
+#:
+#: Override with ``CSRGRAPH_ENUMERATE_LIMIT`` -- a test suite chasing complete
+#: answers wants it higher, and an interactive agent may want it lower.
+DEFAULT_ENUMERATE_LIMIT = int(env_var("ENUMERATE_LIMIT", "5000"))
 
 
 class PatternError(ValueError):
@@ -274,7 +303,7 @@ def run(
     *,
     return_vars: Iterable[str] | None = None,
     limit: int = 25,
-    enumerate_limit: int = 1000,
+    enumerate_limit: int = DEFAULT_ENUMERATE_LIMIT,
     resolver: Callable[[str], str] | None = None,
     expand_predicates: bool = False,
     expander: Any | None = None,
@@ -285,11 +314,11 @@ def run(
 ) -> dict:
     """Match *pattern* and project the result into compact rows.
 
-    ``limit`` caps the rows returned; ``enumerate_limit`` is TRAPI's very
-    different cap on paths *enumerated* before constraints are applied, which is
-    why the two are separate. Under-setting the latter silently under-answers
-    constrained queries, so it keeps the engine's own default rather than
-    inheriting the much smaller row cap.
+    ``limit`` caps the rows returned. ``enumerate_limit`` is the very different
+    cap on paths *enumerated* before constraints are applied -- see
+    :data:`DEFAULT_ENUMERATE_LIMIT` for what it costs and what under-setting it
+    loses. The two must stay separate: conflating them would make a small result
+    cap silently shrink the answer *pool*, not just the returned slice.
 
     ``require_pinned`` rejects a pattern in which every node is a variable. Such
     a pattern gives the matcher no anchor and degenerates into scanning the

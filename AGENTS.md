@@ -84,6 +84,8 @@ surface as empty results rather than errors.
 | `CSRGRAPH_NO_ES` | unset (`1`/`true`/`yes` to disable ES) |
 | `CSRGRAPH_BIOLINK_VERSION` | from the release manifest |
 | `CSRGRAPH_CORPUS_LIMIT` | `2000` (corpus test only) |
+| `CSRGRAPH_LIMIT_CEILING` | `500` (max rows an MCP tool returns) |
+| `CSRGRAPH_ENUMERATE_LIMIT` | `5000` (paths `graph_query` may enumerate) |
 
 The prefix is the point. `DATA_DIR`, `GRAPH_NAME` and `ES_HOST` are generic enough
 that other tools on the same machine set them for their own purposes, and
@@ -300,6 +302,17 @@ or a free-text name** (resolved via `resolve_one`), and paths come back as compa
 result. Result caps are deliberately small (`MAX_HOPS_CEILING`, `LIMIT_CEILING`)
 and a clamped result sets `truncated: true` so a subset is never read as
 exhaustive.
+
+**Two caps, and they are not interchangeable.** `LIMIT_CEILING` (500) bounds
+rows *returned* — pure token cost, ~2,300 tokens per 200 two-column rows.
+`kg_pattern.DEFAULT_ENUMERATE_LIMIT` (5000) bounds paths *enumerated* before
+constraints are applied, so it bounds **correctness**: at the old 1000, a
+qualified-`affects` pattern reported 357 of its 843 answers and a hub wildcard
+964 of 1895, with `truncated` true but no clue how much was missing. Raising it
+costs worst-case latency only on unselective branching (0.16 s → 1.12 s);
+anything that plateaus below the cap is unaffected. Both are overridable
+(`CSRGRAPH_LIMIT_CEILING`, `CSRGRAPH_ENUMERATE_LIMIT`) because a test suite
+chasing complete answers and an interactive agent want different values.
 
 ### `graph_query` — full TRAPI expressiveness, no TRAPI format
 

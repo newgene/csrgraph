@@ -284,3 +284,51 @@ class TestBiolinkVersionPinning:
         kp._expander_for.cache_clear()
         info = kp._expander_for.cache_info()
         assert info.currsize == 0
+
+
+class TestCapsAreSeparate:
+    """``limit`` bounds what is returned; ``enumerate_limit`` bounds what is found.
+
+    Conflating them is the bug worth guarding against: a small row cap must not
+    shrink the *pool* the answers are filtered out of, or a constrained query
+    silently loses answers that exist. That is precisely what a too-low
+    enumerate_limit did — the qualified-affects pattern reported 357 of its 843
+    answers, with ``truncated`` true but no indication of how much was missing.
+    """
+
+    def test_row_limit_does_not_shrink_the_match_pool(self, simple_graph):  # noqa: F811
+        """matched_paths must reflect the enumeration, not the returned slice."""
+        pattern = [["CHEBI:1", "affects", "?g:Gene"]]
+        wide = kp.run(simple_graph, pattern, return_vars=["?g"], limit=10**6)
+        narrow = kp.run(simple_graph, pattern, return_vars=["?g"], limit=1)
+        assert narrow["returned"] == 1
+        assert narrow["truncated"] is True
+        # Same pool either way — only the slice differs.
+        assert narrow["matched_paths"] == wide["matched_paths"]
+
+    def test_enumerate_limit_bounds_the_pool(self, simple_graph):  # noqa: F811
+        pattern = [["CHEBI:1", "affects", "?g:Gene"]]
+        capped = kp.run(simple_graph, pattern, return_vars=["?g"],
+                        limit=10**6, enumerate_limit=1)
+        assert capped["matched_paths"] == 1
+        assert capped["truncated"] is True
+
+    def test_default_enumerate_limit_is_generous_enough_to_matter(self):
+        """A floor, not the exact value — the point is that it is not row-sized.
+
+        Measured plateaus on the 2026-07-19 graph reach 2436; a default in the
+        low hundreds would under-answer by more than half.
+        """
+        assert kp.DEFAULT_ENUMERATE_LIMIT >= 2500
+
+    def test_default_is_env_overridable(self, monkeypatch):
+        monkeypatch.setenv("CSRGRAPH_ENUMERATE_LIMIT", "12345")
+        import importlib
+        import metadata_db
+        metadata_db._warned_env.clear()
+        reloaded = importlib.reload(kp)
+        try:
+            assert reloaded.DEFAULT_ENUMERATE_LIMIT == 12345
+        finally:
+            monkeypatch.delenv("CSRGRAPH_ENUMERATE_LIMIT", raising=False)
+            importlib.reload(reloaded)
