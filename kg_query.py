@@ -40,6 +40,7 @@ from typing import Iterable, List, Literal, Optional, Sequence, Tuple, overload
 from csrgraph_kgx import CSRGraph, MatchStats
 from metadata_db import (
     ElasticsearchMetadataBackend,
+    es_host_from_env,
     HybridMetadataBackend,
     LMDBMetadataBackend,
 )
@@ -49,7 +50,7 @@ from metadata_db import (
 # --------------------------------------------------------------------------- #
 DEFAULT_DATA_DIR = Path(os.environ.get("DATA_DIR", "~/tmp/csrgraph_data")).expanduser()
 DEFAULT_GRAPH = os.environ.get("GRAPH_NAME", "translator_kg_2026-07-19")
-DEFAULT_ES_HOST = os.environ.get("ES_HOST", "http://localhost:9200")
+DEFAULT_ES_HOST = es_host_from_env()
 
 PathEdge = tuple  # (subject, predicate, object)
 

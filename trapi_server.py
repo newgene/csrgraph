@@ -74,6 +74,7 @@ _DEFAULT_LIMIT = 1000
 
 from csrgraph_kgx import CSRGraph
 from metadata_db import (
+    es_host_from_env,
     STORE_FORMAT_VERSION,
     ElasticsearchMetadataBackend,
     HybridMetadataBackend,
@@ -133,12 +134,13 @@ async def _lifespan(app: FastAPI):
 
     This makes ``uvicorn trapi_server:app`` work without calling ``main()``:
     configuration is taken from environment variables (DATA_DIR, GRAPH_NAME,
-    ES_HOST, NO_ES).  When ``main()`` has already populated ``_graph`` this is
+    CSRGRAPH_ES_HOST, NO_ES).  When ``main()`` has already populated ``_graph``
+    this is
     a no-op.
     """
     if _graph is None:
         graph_name = os.environ.get("GRAPH_NAME", "translator_kg_2026-07-19")
-        es_host = os.environ.get("ES_HOST", "http://localhost:9200")
+        es_host = es_host_from_env()
         no_es = os.environ.get("NO_ES", "").lower() in {"1", "true", "yes"}
         _load_graph(_DEFAULT_DATA_DIR, graph_name, es_host=es_host, no_es=no_es)
     yield
@@ -1122,8 +1124,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--es-host",
-        default=os.environ.get("ES_HOST", "http://localhost:9200"),
-        help="Elasticsearch host (env ES_HOST, default: http://localhost:9200)",
+        default=es_host_from_env(),
+        help="Elasticsearch host (env CSRGRAPH_ES_HOST, "
+             "default: http://localhost:9200)",
     )
     parser.add_argument(
         "--no-es",

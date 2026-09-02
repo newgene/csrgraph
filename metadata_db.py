@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import sys
 import tarfile
 import threading
 import time
@@ -75,6 +76,43 @@ def _add_biolink(s: str) -> str:
 #: error is raised — so a release must record this and the server must refuse to
 #: serve on a mismatch rather than answer with silent emptiness.
 STORE_FORMAT_VERSION = 2
+
+#: Default Elasticsearch endpoint when nothing is configured.
+DEFAULT_ES_HOST = "http://localhost:9200"
+
+#: Environment variable naming the Elasticsearch endpoint.
+ES_HOST_ENV = "CSRGRAPH_ES_HOST"
+
+#: The unprefixed name this used to read. Deliberately *not* honoured as a
+#: fallback: ``ES_HOST`` is a name other tools on the same machine set for their
+#: own clusters, and picking it up is the cross-project leak the prefixed name
+#: exists to prevent. Honouring it would reintroduce exactly the bug.
+_LEGACY_ES_HOST_ENV = "ES_HOST"
+
+
+def es_host_from_env(default: str = DEFAULT_ES_HOST) -> str:
+    """Elasticsearch endpoint from ``CSRGRAPH_ES_HOST``, else *default*.
+
+    Warns when the legacy unprefixed ``ES_HOST`` is set and the prefixed one is
+    not. Ignoring it silently would be the same class of failure this module
+    guards against elsewhere: queries would run against the default endpoint --
+    or a *different project's* cluster -- and simply answer nothing, with no
+    error to explain why. A one-line warning on stderr makes the migration
+    visible without reintroducing the leak.
+    """
+    host = os.environ.get(ES_HOST_ENV)
+    if host:
+        return host
+    legacy = os.environ.get(_LEGACY_ES_HOST_ENV)
+    if legacy:
+        print(
+            f"warning: {_LEGACY_ES_HOST_ENV}={legacy!r} is set but ignored; "
+            f"csrgraph reads {ES_HOST_ENV} so it cannot pick up another "
+            f"project's cluster. Using {default!r}. "
+            f"Set {ES_HOST_ENV}={legacy!r} to keep the old behaviour.",
+            file=sys.stderr, flush=True,
+        )
+    return default
 
 
 def qualifier_fingerprint(edge_meta: dict) -> str:

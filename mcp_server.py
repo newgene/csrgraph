@@ -73,7 +73,7 @@ import kg_query as kq
 # --------------------------------------------------------------------------- #
 DATA_DIR = Path(os.environ.get("DATA_DIR", "~/tmp/csrgraph_data")).expanduser()
 GRAPH_NAME = os.environ.get("GRAPH_NAME", kq.DEFAULT_GRAPH)
-ES_HOST = os.environ.get("ES_HOST", kq.DEFAULT_ES_HOST)
+ES_HOST = kq.DEFAULT_ES_HOST      # from CSRGRAPH_ES_HOST; see metadata_db
 NO_ES = os.environ.get("NO_ES", "").lower() in {"1", "true", "yes"}
 
 #: Ceilings applied to whatever the model asks for.  A model that requests

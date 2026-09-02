@@ -69,9 +69,16 @@ surface as empty results rather than errors.
 - **Metadata backend:** Elasticsearch at `http://localhost:9200`, indices
   `translator_kg_2026-07-19_nodes` / `translator_kg_2026-07-19_edges`.
 - **Data dir:** `~/tmp/csrgraph_data`.
-- Override via env vars `GRAPH_NAME`, `DATA_DIR`, `ES_HOST`, or via arguments to
+- Override via env vars `GRAPH_NAME`, `DATA_DIR`, `CSRGRAPH_ES_HOST`, or via arguments to
   `get_graph(name=…, data_dir=…, es_host=…)`. Any graph stem present in the data dir
   works (e.g. small sample graphs `dgidb`, `ttd`).
+
+The ES endpoint variable is **`CSRGRAPH_ES_HOST`**, not `ES_HOST`. The prefix is
+the point: `ES_HOST` is a name other tools on the same machine set for their own
+clusters, and inheriting it would silently point csrgraph at the wrong cluster —
+which returns empty results, not an error. A bare `ES_HOST` is therefore *not*
+honoured as a fallback, since that would reintroduce the leak; it is ignored with
+a warning on stderr naming the replacement (`metadata_db.es_host_from_env`).
 
 ## Node subclassing is ON by default (semantic subtype links)
 

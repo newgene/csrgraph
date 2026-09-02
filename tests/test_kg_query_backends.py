@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import kg_query as kq  # noqa: E402
+import metadata_db  # noqa: E402
 from metadata_db import (  # noqa: E402
     ElasticsearchMetadataBackend,
     HybridMetadataBackend,
@@ -106,3 +107,42 @@ class TestGetGraphValidation:
         (tmp_path / "g.csrgraph.pkl.zst").write_bytes(b"")   # snapshot exists
         with pytest.raises(FileNotFoundError, match="LMDB store not found"):
             kq.get_graph(name="g", data_dir=tmp_path, backend="hybrid")
+
+
+class TestEsHostEnv:
+    """``CSRGRAPH_ES_HOST`` is read; the unprefixed ``ES_HOST`` is not.
+
+    The prefix exists because ``ES_HOST`` is a name other tools on the same
+    machine set for their own clusters. Honouring it as a fallback would
+    reintroduce the leak, so it must be ignored — but ignored *loudly*, since
+    querying the wrong cluster returns empty results rather than an error.
+    """
+
+    def test_prefixed_var_is_used(self, monkeypatch):
+        monkeypatch.setenv("CSRGRAPH_ES_HOST", "http://a:9200")
+        monkeypatch.delenv("ES_HOST", raising=False)
+        assert metadata_db.es_host_from_env() == "http://a:9200"
+
+    def test_default_when_nothing_is_set(self, monkeypatch):
+        monkeypatch.delenv("CSRGRAPH_ES_HOST", raising=False)
+        monkeypatch.delenv("ES_HOST", raising=False)
+        assert metadata_db.es_host_from_env() == metadata_db.DEFAULT_ES_HOST
+
+    def test_legacy_var_is_ignored_not_inherited(self, monkeypatch, capsys):
+        monkeypatch.delenv("CSRGRAPH_ES_HOST", raising=False)
+        monkeypatch.setenv("ES_HOST", "http://someone-elses-cluster:9999")
+        assert metadata_db.es_host_from_env() == metadata_db.DEFAULT_ES_HOST
+        # Loudly, or a stale setting becomes an empty-results mystery.
+        err = capsys.readouterr().err
+        assert "ES_HOST" in err and "CSRGRAPH_ES_HOST" in err
+
+    def test_prefixed_wins_and_stays_quiet(self, monkeypatch, capsys):
+        monkeypatch.setenv("CSRGRAPH_ES_HOST", "http://a:9200")
+        monkeypatch.setenv("ES_HOST", "http://b:9200")
+        assert metadata_db.es_host_from_env() == "http://a:9200"
+        assert capsys.readouterr().err == ""
+
+    def test_explicit_default_is_respected(self, monkeypatch):
+        monkeypatch.delenv("CSRGRAPH_ES_HOST", raising=False)
+        monkeypatch.delenv("ES_HOST", raising=False)
+        assert metadata_db.es_host_from_env("http://z:1") == "http://z:1"
