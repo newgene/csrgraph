@@ -38,6 +38,13 @@ dependencies = [
 #     change under you between installs.
 #   mcp — 2.x renamed FastMCP to MCPServer and changed other APIs, so mcp_server.py
 #     will not import on 1.x. Capped below 3 for the same reason.
+#     Also 2.x-specific: an anticipated tool failure must raise
+#     mcp.server.mcpserver.exceptions.ToolError. Only that type's message reaches
+#     the client; MCPServer replaces every other exception's text with a bare
+#     "Error executing tool <name>" and withholds the original by design. Raising
+#     ValueError therefore delivers no message at all — see mcp_server._tool, and
+#     tests/test_mcp_server.py, which drives call_tool() rather than the tool
+#     functions because that is the only place the difference is visible.
 lmdb = ["lmdb>=1.4,<3"]
 es = ["elasticsearch>=8,<10"]
 duckdb = ["duckdb>=0.10"]

@@ -53,11 +53,12 @@ import json
 import os
 import sys
 import threading
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 
 try:
     from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
 except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     raise SystemExit(
         "The MCP server needs the optional 'mcp' extra:\n"
@@ -221,11 +222,51 @@ def _categories(top: int) -> list[str] | None:
 # --------------------------------------------------------------------------- #
 # Tools
 # --------------------------------------------------------------------------- #
+#: Exceptions that mean "the caller asked for something impossible", as opposed
+#: to "this server is broken". All three carry a message written to be read by
+#: whoever made the call:
+#:
+#:   * PatternError   -- a malformed graph_query pattern, naming the triple
+#:   * ValueError     -- an unresolvable name, or a CURIE not in the graph
+#:   * RuntimeError   -- a lookup needing Elasticsearch while it is unavailable
+#:
+#: Deliberately *not* a blanket ``Exception``. TypeError, AttributeError, KeyError
+#: and friends indicate a defect in this file rather than in the request, and
+#: those should stay crashes so the server logs a traceback instead of telling
+#: the model its input was at fault.
+_ANTICIPATED = (kp.PatternError, ValueError, RuntimeError)
+
+
+def _tool(fn):
+    """Convert anticipated failures into ``ToolError`` for the tool boundary.
+
+    Under mcp >= 2 this is the difference between a usable error and a useless
+    one. ``MCPServer`` forwards a ``ToolError`` message to the client verbatim,
+    but replaces every other exception's text with a bare ``Error executing tool
+    <name>`` (``tools/base.py``: ``except Exception`` -> ``UnexpectedToolError``),
+    withholding the original by design. So a hand-written, actionable message --
+    "triple 0: unknown edge field 'bogus'" -- reached the model as nothing at
+    all, and the three documented graph_query error cases were indistinguishable.
+
+    Applied as a decorator *under* ``@mcp.tool`` so the conversion happens before
+    the SDK's handler sees the exception. ``functools.wraps`` keeps
+    ``__wrapped__`` intact, which is what lets ``mcp.tool`` still derive the input
+    schema from the real signature.
+    """
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except _ANTICIPATED as exc:
+            raise ToolError(str(exc)) from exc
+    return wrapper
+
 @mcp.tool(
     description="Resolve a free-text name or symbol to candidate CURIEs, best "
                 "first. Requires Elasticsearch. Pass a category to disambiguate "
                 "a symbol shared across entity types."
 )
+@_tool
 def resolve_entity(text: str, category: str | None = None, top: int = 5) -> list[dict]:
     with _LOCK:
         return kq.resolve(text, category=category, graph=_g(),
@@ -237,6 +278,7 @@ def resolve_entity(text: str, category: str | None = None, top: int = 5) -> list
                 "node of a target Biolink category. Use for 'what is X linked "
                 "to' questions. max_hops>1 is much slower."
 )
+@_tool
 def find_associations(
     entity: str,
     target_category: str,
@@ -264,6 +306,7 @@ def find_associations(
     description="Find how two specific entities are connected: shortest "
                 "path(s) between them. Both ends are subtype-expanded."
 )
+@_tool
 def connect_entities(
     source: str,
     target: str,
@@ -289,6 +332,7 @@ def connect_entities(
     description="List the direct (1-hop) neighbours of an entity, optionally "
                 "filtered by Biolink category or predicate."
 )
+@_tool
 def list_neighbors(
     entity: str,
     category: str | None = None,
@@ -324,6 +368,7 @@ def list_neighbors(
         "['?drug','treats','?d']] with return_vars ['?d','?drug']."
     )
 )
+@_tool
 def graph_query(
     pattern: list[list],
     return_vars: list[str] | None = None,
@@ -332,19 +377,17 @@ def graph_query(
 ) -> dict:
     limit = min(limit, LIMIT_CEILING)
     with _LOCK:
-        try:
-            return kp.run(
-                _g(), pattern,
-                return_vars=return_vars,
-                limit=limit,
-                resolver=_resolver(),
-                expand_predicates=expand_predicates,
-                biolink_version=_biolink_version(),
-                name_lookup=lambda curies: kq.names(_g(), curies),
-            )
-        except kp.PatternError as exc:
-            # Surface the triple-level message; a model can act on that.
-            raise ValueError(str(exc)) from exc
+        # PatternError reaches the client through @_tool; it needs no handling
+        # here, and catching it to re-raise a ValueError actively broke it.
+        return kp.run(
+            _g(), pattern,
+            return_vars=return_vars,
+            limit=limit,
+            resolver=_resolver(),
+            expand_predicates=expand_predicates,
+            biolink_version=_biolink_version(),
+            name_lookup=lambda curies: kq.names(_g(), curies),
+        )
 
 
 @mcp.tool(
@@ -352,6 +395,7 @@ def graph_query(
                 "this graph. Call before authoring a graph_query pattern rather "
                 "than guessing predicate names."
 )
+@_tool
 def describe_schema(top_categories: int = 40) -> dict:
     with _LOCK:
         counts = getattr(_g(), "predicate_counts", {}) or {}
@@ -374,6 +418,7 @@ def describe_schema(top_categories: int = 40) -> dict:
     description="Report which graph release is loaded and which capabilities "
                 "are available. Call this first if a query fails unexpectedly."
 )
+@_tool
 def graph_info() -> dict:
     manifest = _manifest()
     return {

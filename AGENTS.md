@@ -341,6 +341,16 @@ and its categories, so a model authors patterns from the real vocabulary instead
 of guessing. Categories need an ES terms aggregation and come back `null` on
 LMDB-only, rather than being guessed from the Biolink model.
 
+Anticipated failures must raise **`ToolError`** (`mcp.server.mcpserver.exceptions`),
+which `_tool` does for `PatternError`, `ValueError` and `RuntimeError`. Only that
+type's message reaches the client: `MCPServer` replaces every other exception's
+text with a bare `Error executing tool <name>`, so raising `ValueError` delivered
+*no* message and made the three documented `graph_query` errors identical. The
+tuple is narrow on purpose — a `TypeError` or `KeyError` is a defect here, not a
+bad request, and should stay a crash with a logged traceback.
+`tests/test_mcp_server.py` drives `call_tool()` rather than the tool functions,
+because that is the only place the difference shows.
+
 Two behaviours are load-bearing, not incidental:
 
 - **Calls are serialised** behind one lock. LMDB reads under concurrent threads
