@@ -235,8 +235,8 @@ dirs + atomic `current` symlink + a pull-based updater.
     2026-06-10/   2026-06-01/ ...   # immutable, one per F1 release
   current -> releases/2026-06-10     # atomic swap point
 ```
-TRAPI server runs with `DATA_DIR=/srv/csrgraph/current`,
-`GRAPH_NAME=translator_kg_2026-07-19`, `NO_ES=1` (LMDB-only per the question's scope). The
+TRAPI server runs with `CSRGRAPH_DATA_DIR=/srv/csrgraph/current`,
+`CSRGRAPH_GRAPH_NAME=translator_kg_2026-07-19`, `CSRGRAPH_NO_ES=1` (LMDB-only per the question's scope). The
 graph stem is whatever the release was built as; it is no longer the bare `translator_kg`,
 which is now a stale name from the April dataset.
 
@@ -290,7 +290,7 @@ custom worker's swap/restart/rollback entirely. The "monitor upstream" role move
 
 ### Deployment mechanics
 - **Deployment** (or Helm chart) with `RollingUpdate` strategy; env `DATA_DIR`, `GRAPH_NAME`,
-  `NO_ES=1` via ConfigMap.
+  `CSRGRAPH_NO_ES=1` via ConfigMap.
 - **Probes**: readiness + liveness hit `GET /version` (F3). Readiness gates traffic until the
   graph + LMDB are loaded, so rolling update naturally drains old pods only after new ones serve.
 - **Release = version bump**: changing the image tag (Alt A) or the `version` env / subpath

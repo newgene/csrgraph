@@ -237,7 +237,9 @@ def _gate_corpus(release_dir: Path, graph_name: str) -> None:
         print("      gate: corpus skipped (trapi_corpus not importable)", flush=True)
         return
     print("      gate: corpus invariants ...", flush=True)
-    env = {**os.environ, "DATA_DIR": str(release_dir), "GRAPH_NAME": graph_name}
+    env = {**os.environ,
+           "CSRGRAPH_DATA_DIR": str(release_dir),
+           "CSRGRAPH_GRAPH_NAME": graph_name}
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "-q",
          str(Path(__file__).resolve().parent / "tests" / "test_corpus.py")],

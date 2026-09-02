@@ -10,7 +10,7 @@ the wrong default even though the library one is.
 Run it. stdio is the default and the usual case for a local client -- the client
 spawns its own copy, so nothing needs starting or stopping::
 
-    DATA_DIR=~/tmp/releases/2026-07-19 GRAPH_NAME=translator_kg_2026-07-19 \\
+    CSRGRAPH_DATA_DIR=~/tmp/releases/2026-07-19 CSRGRAPH_GRAPH_NAME=translator_kg_2026-07-19 \\
         .venv/bin/python mcp_server.py
 
     claude mcp add csrgraph -- /abs/path/.venv/bin/python /abs/path/mcp_server.py
@@ -67,14 +67,17 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
 
 import kg_pattern as kp
 import kg_query as kq
+from metadata_db import env_flag, env_var
 
 # --------------------------------------------------------------------------- #
-# Configuration (same env vars as trapi_server.py / kg_query.py)
+# Configuration. All names are CSRGRAPH_-prefixed (see metadata_db.env_var):
+# CSRGRAPH_DATA_DIR, CSRGRAPH_GRAPH_NAME, CSRGRAPH_ES_HOST, CSRGRAPH_NO_ES,
+# CSRGRAPH_BIOLINK_VERSION.
 # --------------------------------------------------------------------------- #
-DATA_DIR = Path(os.environ.get("DATA_DIR", "~/tmp/csrgraph_data")).expanduser()
-GRAPH_NAME = os.environ.get("GRAPH_NAME", kq.DEFAULT_GRAPH)
+DATA_DIR = Path(env_var("DATA_DIR", "~/tmp/csrgraph_data")).expanduser()
+GRAPH_NAME = env_var("GRAPH_NAME", kq.DEFAULT_GRAPH)
 ES_HOST = kq.DEFAULT_ES_HOST      # from CSRGRAPH_ES_HOST; see metadata_db
-NO_ES = os.environ.get("NO_ES", "").lower() in {"1", "true", "yes"}
+NO_ES = env_flag("NO_ES")
 
 #: Ceilings applied to whatever the model asks for.  A model that requests
 #: max_hops=5 on this graph is not going to like the answer, and neither is its
@@ -181,7 +184,7 @@ def _biolink_version() -> str | None:
     toolkit fetches", which drifts as Biolink releases and silently produces
     answers from a different model than the graph was built with.
     """
-    return os.environ.get("BIOLINK_VERSION") or _manifest().get("biolink_version")
+    return env_var("BIOLINK_VERSION") or _manifest().get("biolink_version")
 
 
 def _resolver():

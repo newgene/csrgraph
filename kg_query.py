@@ -40,6 +40,7 @@ from typing import Iterable, List, Literal, Optional, Sequence, Tuple, overload
 from csrgraph_kgx import CSRGraph, MatchStats
 from metadata_db import (
     ElasticsearchMetadataBackend,
+    env_var,
     es_host_from_env,
     HybridMetadataBackend,
     LMDBMetadataBackend,
@@ -48,8 +49,8 @@ from metadata_db import (
 # --------------------------------------------------------------------------- #
 # Defaults (env-overridable, matching trapi_server.py conventions)
 # --------------------------------------------------------------------------- #
-DEFAULT_DATA_DIR = Path(os.environ.get("DATA_DIR", "~/tmp/csrgraph_data")).expanduser()
-DEFAULT_GRAPH = os.environ.get("GRAPH_NAME", "translator_kg_2026-07-19")
+DEFAULT_DATA_DIR = Path(env_var("DATA_DIR", "~/tmp/csrgraph_data")).expanduser()
+DEFAULT_GRAPH = env_var("GRAPH_NAME", "translator_kg_2026-07-19")
 DEFAULT_ES_HOST = es_host_from_env()
 
 PathEdge = tuple  # (subject, predicate, object)

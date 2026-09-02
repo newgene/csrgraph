@@ -69,16 +69,34 @@ surface as empty results rather than errors.
 - **Metadata backend:** Elasticsearch at `http://localhost:9200`, indices
   `translator_kg_2026-07-19_nodes` / `translator_kg_2026-07-19_edges`.
 - **Data dir:** `~/tmp/csrgraph_data`.
-- Override via env vars `GRAPH_NAME`, `DATA_DIR`, `CSRGRAPH_ES_HOST`, or via arguments to
+- Override via env vars `CSRGRAPH_GRAPH_NAME`, `CSRGRAPH_DATA_DIR`,
+  `CSRGRAPH_ES_HOST`, or via arguments to
   `get_graph(name=…, data_dir=…, es_host=…)`. Any graph stem present in the data dir
   works (e.g. small sample graphs `dgidb`, `ttd`).
 
-The ES endpoint variable is **`CSRGRAPH_ES_HOST`**, not `ES_HOST`. The prefix is
-the point: `ES_HOST` is a name other tools on the same machine set for their own
-clusters, and inheriting it would silently point csrgraph at the wrong cluster —
-which returns empty results, not an error. A bare `ES_HOST` is therefore *not*
-honoured as a fallback, since that would reintroduce the leak; it is ignored with
-a warning on stderr naming the replacement (`metadata_db.es_host_from_env`).
+### Every environment variable is `CSRGRAPH_`-prefixed
+
+| Variable | Default |
+| --- | --- |
+| `CSRGRAPH_DATA_DIR` | `~/tmp/csrgraph_data` |
+| `CSRGRAPH_GRAPH_NAME` | `translator_kg_2026-07-19` |
+| `CSRGRAPH_ES_HOST` | `http://localhost:9200` |
+| `CSRGRAPH_NO_ES` | unset (`1`/`true`/`yes` to disable ES) |
+| `CSRGRAPH_BIOLINK_VERSION` | from the release manifest |
+| `CSRGRAPH_CORPUS_LIMIT` | `2000` (corpus test only) |
+
+The prefix is the point. `DATA_DIR`, `GRAPH_NAME` and `ES_HOST` are generic enough
+that other tools on the same machine set them for their own purposes, and
+inheriting one aims csrgraph at the wrong data or the wrong cluster — which
+returns **empty results, not an error**.
+
+Bare names are therefore *not* honoured as a fallback: doing so would reintroduce
+the leak, since another project's value would still be read. They are ignored with
+one warning per name on stderr (`metadata_db.env_var`), so a stale setting is
+visible rather than mysterious. Read them only through `env_var` / `env_flag`;
+a fresh `os.environ.get("DATA_DIR")` reopens the hole. That includes anything
+placed in a `.env` beside `trapi_server.py`, which is loaded verbatim — use the
+prefixed names there too.
 
 ## Node subclassing is ON by default (semantic subtype links)
 
@@ -187,7 +205,7 @@ without a manifest still works, unchecked, so hand-built stores keep serving.
 Serve a release with the store it ships:
 
 ```bash
-DATA_DIR=~/tmp/releases/2026-08-14 GRAPH_NAME=dgidb NO_ES=1 \
+CSRGRAPH_DATA_DIR=~/tmp/releases/2026-08-14 CSRGRAPH_GRAPH_NAME=dgidb CSRGRAPH_NO_ES=1 \
     .venv/bin/python trapi_server.py
 ```
 
@@ -231,7 +249,7 @@ falls back to a 4-disease pool, so the long-tail queries stop being long-tail.
 Then point at a built graph and put both on the path:
 
 ```bash
-DATA_DIR=~/tmp/releases/2026-07-19 GRAPH_NAME=translator_kg_2026-07-19 PYTHONPATH=~/tmp \
+CSRGRAPH_DATA_DIR=~/tmp/releases/2026-07-19 CSRGRAPH_GRAPH_NAME=translator_kg_2026-07-19 PYTHONPATH=~/tmp \
     .venv/bin/python -m pytest tests/test_corpus.py -q
 ```
 
@@ -253,7 +271,7 @@ extra (`pip install -e ".[mcp]"`, pulled in by `[all]`); without it the module
 exits with an install hint rather than a traceback.
 
 ```bash
-DATA_DIR=~/tmp/releases/2026-07-19 GRAPH_NAME=translator_kg_2026-07-19 \
+CSRGRAPH_DATA_DIR=~/tmp/releases/2026-07-19 CSRGRAPH_GRAPH_NAME=translator_kg_2026-07-19 \
     .venv/bin/python mcp_server.py     # stdio transport (default)
 
 claude mcp add csrgraph -- /abs/path/.venv/bin/python /abs/path/mcp_server.py

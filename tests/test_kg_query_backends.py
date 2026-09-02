@@ -109,14 +109,57 @@ class TestGetGraphValidation:
             kq.get_graph(name="g", data_dir=tmp_path, backend="hybrid")
 
 
-class TestEsHostEnv:
-    """``CSRGRAPH_ES_HOST`` is read; the unprefixed ``ES_HOST`` is not.
+class TestEnvVar:
+    """``CSRGRAPH_<NAME>`` is read; the unprefixed ``<NAME>`` is not.
 
-    The prefix exists because ``ES_HOST`` is a name other tools on the same
-    machine set for their own clusters. Honouring it as a fallback would
-    reintroduce the leak, so it must be ignored — but ignored *loudly*, since
-    querying the wrong cluster returns empty results rather than an error.
+    The prefix exists because ``DATA_DIR``, ``GRAPH_NAME`` and ``ES_HOST`` are
+    names other tools on the same machine set for their own purposes. Honouring
+    one as a fallback would reintroduce the leak, so it must be ignored — but
+    ignored *loudly*, since reading the wrong data or cluster returns empty
+    results rather than an error.
     """
+
+    @pytest.fixture(autouse=True)
+    def _clear_warned(self):
+        """The warn-once set is module state; reset it around each test."""
+        metadata_db._warned_env.clear()
+        yield
+        metadata_db._warned_env.clear()
+
+    @pytest.mark.parametrize("name", [
+        "DATA_DIR", "GRAPH_NAME", "ES_HOST", "NO_ES", "BIOLINK_VERSION",
+    ])
+    def test_every_name_prefers_the_prefix_and_ignores_the_bare(
+        self, name, monkeypatch, capsys
+    ):
+        monkeypatch.setenv(name, "bare")
+        monkeypatch.delenv(metadata_db.ENV_PREFIX + name, raising=False)
+        assert metadata_db.env_var(name, "fallback") == "fallback"
+        assert name in capsys.readouterr().err
+
+        monkeypatch.setenv(metadata_db.ENV_PREFIX + name, "prefixed")
+        assert metadata_db.env_var(name, "fallback") == "prefixed"
+
+    def test_warning_is_emitted_once_per_name(self, monkeypatch, capsys):
+        """Several modules read DATA_DIR; one stale value is one warning."""
+        monkeypatch.delenv(metadata_db.ENV_PREFIX + "DATA_DIR", raising=False)
+        monkeypatch.setenv("DATA_DIR", "/somewhere/else")
+        for _ in range(3):
+            metadata_db.env_var("DATA_DIR", "d")
+        assert capsys.readouterr().err.count("warning:") == 1
+
+    @pytest.mark.parametrize("value, expected", [
+        ("1", True), ("true", True), ("TRUE", True), ("yes", True),
+        ("0", False), ("false", False), ("", False), ("maybe", False),
+    ])
+    def test_env_flag_truthiness(self, value, expected, monkeypatch):
+        monkeypatch.setenv(metadata_db.ENV_PREFIX + "NO_ES", value)
+        assert metadata_db.env_flag("NO_ES") is expected
+
+    def test_env_flag_false_when_unset(self, monkeypatch):
+        monkeypatch.delenv(metadata_db.ENV_PREFIX + "NO_ES", raising=False)
+        monkeypatch.delenv("NO_ES", raising=False)
+        assert metadata_db.env_flag("NO_ES") is False
 
     def test_prefixed_var_is_used(self, monkeypatch):
         monkeypatch.setenv("CSRGRAPH_ES_HOST", "http://a:9200")

@@ -51,7 +51,8 @@ _HERE = Path(__file__).parent.resolve()
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from metadata_db import (  # noqa: E402
+from metadata_db import (
+    env_var,  # noqa: E402
     DuckDBMetadataBackend,
     ElasticsearchMetadataBackend,
     LMDBMetadataBackend,
@@ -88,7 +89,7 @@ class _Tee(io.TextIOBase):
 # Default data path
 # ---------------------------------------------------------------------------
 _DEFAULT_DATA_DIR = Path(
-    os.environ.get("CSRGRAPH_DATA_DIR", "~/tmp/csrgraph_data")
+    env_var("DATA_DIR", "~/tmp/csrgraph_data")
 ).expanduser()
 _DEFAULT_ARCHIVE = _DEFAULT_DATA_DIR / "dgidb.tar.zst"
 

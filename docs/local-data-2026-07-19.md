@@ -19,7 +19,7 @@ Archive members: `nodes.jsonl` (1,077,818,157 B), `edges.jsonl`
 
 Named with a version suffix rather than the bare `translator_kg` default, so the
 previous April dataset is untouched. Point tools at it with
-`GRAPH_NAME=translator_kg_2026-07-19`, or pass
+`CSRGRAPH_GRAPH_NAME=translator_kg_2026-07-19`, or pass
 `--stem` / `get_graph(name=...)`.
 
 ## Graph shape — the two implementations agree

@@ -13,7 +13,7 @@ rather than for code changes.
 
 Enable by pointing at a built graph::
 
-    DATA_DIR=~/tmp/csrgraph_data GRAPH_NAME=translator_kg_2026-07-19 \
+    CSRGRAPH_DATA_DIR=~/tmp/csrgraph_data CSRGRAPH_GRAPH_NAME=translator_kg_2026-07-19 \
         .venv/bin/python -m pytest tests/test_corpus.py -q
 
 ``trapi_corpus.py`` comes from https://github.com/TranslatorSRI/HelmsDeep and
@@ -30,9 +30,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", "~/tmp/csrgraph_data")).expanduser()
-STEM = os.environ.get("GRAPH_NAME", "translator_kg")
-LIMIT = int(os.environ.get("CORPUS_LIMIT", "2000"))
+from metadata_db import env_var  # noqa: E402
+
+DATA_DIR = Path(env_var("DATA_DIR", "~/tmp/csrgraph_data")).expanduser()
+STEM = env_var("GRAPH_NAME", "translator_kg")
+LIMIT = int(env_var("CORPUS_LIMIT", "2000"))
 
 _GRAPH = DATA_DIR / f"{STEM}.csrgraph.pkl.zst"
 _LMDB = DATA_DIR / f"{STEM}.metadata.lmdb"

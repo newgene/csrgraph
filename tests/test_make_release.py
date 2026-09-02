@@ -247,7 +247,8 @@ def test_version_endpoint_reports_the_release(archive: Path, tmp_path: Path):
     rel = _publish(archive, tmp_path)
     # Point the app at the release the way a deployment would.
     import os
-    os.environ.update(DATA_DIR=str(rel), GRAPH_NAME="kg", NO_ES="1")
+    os.environ.update(CSRGRAPH_DATA_DIR=str(rel), CSRGRAPH_GRAPH_NAME="kg",
+                      CSRGRAPH_NO_ES="1")
     trapi_server._graph = None
     trapi_server._manifest = None
     trapi_server._DEFAULT_DATA_DIR = rel  # type: ignore[attr-defined]

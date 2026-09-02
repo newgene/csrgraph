@@ -60,8 +60,6 @@ if _env_file.exists():
                 if _val and _key not in os.environ:  # don't override existing env
                     os.environ[_key] = _val
 
-_DEFAULT_DATA_DIR = Path(os.environ.get("DATA_DIR", "~/tmp/csrgraph_data")).expanduser()
-
 # Bounds on how many paths a single query may enumerate.  These are an
 # enumeration budget, not an answer count: constraints are applied after the cap,
 # so a constrained query can return far fewer results than the limit (see
@@ -74,6 +72,8 @@ _DEFAULT_LIMIT = 1000
 
 from csrgraph_kgx import CSRGraph
 from metadata_db import (
+    env_flag,
+    env_var,
     es_host_from_env,
     STORE_FORMAT_VERSION,
     ElasticsearchMetadataBackend,
@@ -81,6 +81,8 @@ from metadata_db import (
     LMDBMetadataBackend,
 )
 from trapi import display_query_graph, query
+
+_DEFAULT_DATA_DIR = Path(env_var("DATA_DIR", "~/tmp/csrgraph_data")).expanduser()
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -134,14 +136,14 @@ async def _lifespan(app: FastAPI):
 
     This makes ``uvicorn trapi_server:app`` work without calling ``main()``:
     configuration is taken from environment variables (DATA_DIR, GRAPH_NAME,
-    CSRGRAPH_ES_HOST, NO_ES).  When ``main()`` has already populated ``_graph``
+    CSRGRAPH_ES_HOST, CSRGRAPH_NO_ES).  When ``main()`` has already populated ``_graph``
     this is
     a no-op.
     """
     if _graph is None:
-        graph_name = os.environ.get("GRAPH_NAME", "translator_kg_2026-07-19")
+        graph_name = env_var("GRAPH_NAME", "translator_kg_2026-07-19")
         es_host = es_host_from_env()
-        no_es = os.environ.get("NO_ES", "").lower() in {"1", "true", "yes"}
+        no_es = env_flag("NO_ES")
         _load_graph(_DEFAULT_DATA_DIR, graph_name, es_host=es_host, no_es=no_es)
     yield
 
@@ -1113,7 +1115,7 @@ def main() -> None:
         default=_DEFAULT_DATA_DIR,
         help=(
             "Directory containing graph and LMDB files "
-            f"(env DATA_DIR, default: {_DEFAULT_DATA_DIR})"
+            f"(env CSRGRAPH_DATA_DIR, default: {_DEFAULT_DATA_DIR})"
         ),
     )
     parser.add_argument(

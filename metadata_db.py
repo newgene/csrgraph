@@ -80,39 +80,56 @@ STORE_FORMAT_VERSION = 2
 #: Default Elasticsearch endpoint when nothing is configured.
 DEFAULT_ES_HOST = "http://localhost:9200"
 
-#: Environment variable naming the Elasticsearch endpoint.
-ES_HOST_ENV = "CSRGRAPH_ES_HOST"
+#: Every environment variable this project reads is prefixed with this.
+#:
+#: The unprefixed names -- ``DATA_DIR``, ``GRAPH_NAME``, ``ES_HOST``, ``NO_ES``
+#: -- are generic enough that other tools on the same machine set them for their
+#: own purposes, and inheriting one points csrgraph at the wrong data or the
+#: wrong cluster. That fails in the worst way available here: the query runs,
+#: finds nothing, and reports no error.
+ENV_PREFIX = "CSRGRAPH_"
 
-#: The unprefixed name this used to read. Deliberately *not* honoured as a
-#: fallback: ``ES_HOST`` is a name other tools on the same machine set for their
-#: own clusters, and picking it up is the cross-project leak the prefixed name
-#: exists to prevent. Honouring it would reintroduce exactly the bug.
-_LEGACY_ES_HOST_ENV = "ES_HOST"
+#: Names already warned about, so one stale variable read by several modules
+#: produces one warning rather than one per reader.
+_warned_env: set[str] = set()
 
 
-def es_host_from_env(default: str = DEFAULT_ES_HOST) -> str:
-    """Elasticsearch endpoint from ``CSRGRAPH_ES_HOST``, else *default*.
+def env_var(name: str, default: str | None = None) -> str | None:
+    """Read ``CSRGRAPH_<name>``, falling back to *default*.
 
-    Warns when the legacy unprefixed ``ES_HOST`` is set and the prefixed one is
-    not. Ignoring it silently would be the same class of failure this module
-    guards against elsewhere: queries would run against the default endpoint --
-    or a *different project's* cluster -- and simply answer nothing, with no
-    error to explain why. A one-line warning on stderr makes the migration
-    visible without reintroducing the leak.
+    The unprefixed ``<name>`` is deliberately **not** honoured as a fallback:
+    doing so would reintroduce the very leak the prefix exists to stop, since
+    another project's ``DATA_DIR`` or ``ES_HOST`` would still be picked up. But
+    ignoring it silently would swap one invisible failure for another, so a
+    stale unprefixed variable warns on stderr and names its replacement.
+
+    Warnings go to stderr, never stdout: under the MCP stdio transport stdout is
+    the JSON-RPC channel and a stray line there is a protocol error.
     """
-    host = os.environ.get(ES_HOST_ENV)
-    if host:
-        return host
-    legacy = os.environ.get(_LEGACY_ES_HOST_ENV)
-    if legacy:
+    value = os.environ.get(ENV_PREFIX + name)
+    if value:
+        return value
+    legacy = os.environ.get(name)
+    if legacy and name not in _warned_env:
+        _warned_env.add(name)
         print(
-            f"warning: {_LEGACY_ES_HOST_ENV}={legacy!r} is set but ignored; "
-            f"csrgraph reads {ES_HOST_ENV} so it cannot pick up another "
-            f"project's cluster. Using {default!r}. "
-            f"Set {ES_HOST_ENV}={legacy!r} to keep the old behaviour.",
+            f"warning: {name}={legacy!r} is set but ignored; csrgraph reads "
+            f"{ENV_PREFIX}{name} so it cannot inherit another project's "
+            f"setting. Using {default!r}. Set "
+            f"{ENV_PREFIX}{name}={legacy!r} to keep the old behaviour.",
             file=sys.stderr, flush=True,
         )
     return default
+
+
+def env_flag(name: str) -> bool:
+    """Boolean form of :func:`env_var` — true for ``1``, ``true`` or ``yes``."""
+    return (env_var(name, "") or "").strip().lower() in {"1", "true", "yes"}
+
+
+def es_host_from_env(default: str = DEFAULT_ES_HOST) -> str:
+    """Elasticsearch endpoint from ``CSRGRAPH_ES_HOST``, else *default*."""
+    return env_var("ES_HOST", default) or default
 
 
 def qualifier_fingerprint(edge_meta: dict) -> str:
